@@ -19,6 +19,7 @@ require (
 	github.com/aalpar/deheap v1.1.2
 	github.com/abbot/go-http-auth v0.4.0
 	github.com/adrg/xdg v0.5.3
+	github.com/aliyun/aliyun-oss-go-sdk v3.0.2+incompatible
 	github.com/anacrolix/dms v1.7.2
 	github.com/anacrolix/log v0.17.0
 	github.com/apache/arrow-go/v18 v18.7.0 // indirect
@@ -79,6 +80,7 @@ require (
 	github.com/rivo/uniseg v0.4.7
 	github.com/rogpeppe/go-internal v1.15.0
 	github.com/shirou/gopsutil/v4 v4.26.6
+	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/skratchdot/open-golang v0.0.0-20200116055534-eef842397966
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
