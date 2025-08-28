@@ -26,6 +26,7 @@ import (
 var ErrQRCodeTimeout = fmt.Errorf("QR code scanning timeout, please run configuration again")
 
 const (
+	errorCodeNoAuth              = 40140116
 	errorCodeRefreshTokenExpired = 40140119
 	errorCodeRefreshTokenInvalid = 40140120
 )
@@ -155,7 +156,7 @@ func (ts *TokenSource) refreshToken() error {
 		return fmt.Errorf("failed to refresh token: %v", err)
 	}
 	// Check if token expired
-	if resp.Code == errorCodeRefreshTokenExpired || resp.Code == errorCodeRefreshTokenInvalid {
+	if resp.Code == errorCodeRefreshTokenExpired || resp.Code == errorCodeRefreshTokenInvalid || resp.Code == errorCodeNoAuth {
 		// Clear token
 		ts.token = nil
 		ts.expiry = time.Time{}
