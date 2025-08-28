@@ -352,12 +352,12 @@ func (ts *TokenSource) codeToToken(ctx context.Context, authData *api.AuthDevice
 // calculateCodeChallenge calculates the code challenge.
 func calculateCodeChallenge(codeVerifier string) string {
 	hash := sha256.Sum256([]byte(codeVerifier))
-	return base64.StdEncoding.EncodeToString(hash[:])
+	return base64.RawURLEncoding.EncodeToString(hash[:])
 }
 
 // generateCodeVerifier generates a code verifier
 func generateCodeVerifier() string {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	result := make([]byte, 64)
 	length := len(charset)
 	// Use cryptographically secure random numbers
