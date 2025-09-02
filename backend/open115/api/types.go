@@ -1,3 +1,4 @@
+// Package api provides data structures for the 115 Cloud Storage API.
 package api
 
 import (
@@ -15,6 +16,7 @@ type Response struct {
 	Errno   int    `json:"errno,omitempty"`   // Errno is the error number.
 }
 
+// AuthDeviceCodeResponse represents the response for device code authorization.
 type AuthDeviceCodeResponse struct {
 	Response
 	Data AuthDeviceCodeData `json:"data"` // Data contains device code authorization response data.
@@ -257,7 +259,7 @@ type UploadTokenData struct {
 	AccessKeySecret string `json:"AccessKeySecret"` // AccessKeySecret is the access key secret.
 	SecurityToken   string `json:"SecurityToken"`   // SecurityToken is the security token.
 	Expiration      string `json:"Expiration"`      // Expiration is the expiration time.
-	AccessKeyId     string `json:"AccessKeyId"`     // AccessKeyId is the access key ID.
+	AccessKeyID     string `json:"AccessKeyId"`     // AccessKeyID is the access key ID.
 }
 
 // InitUploadRequest represents the request to initialize an upload.
@@ -308,6 +310,7 @@ func (d *InitUploadData) GetCallback() (Callback, error) {
 	return Callback{}, fmt.Errorf("unsupported callback type: %v", d.Callback)
 }
 
+// Callback holds callback information for upload operations.
 type Callback struct {
 	Callback    string `json:"callback"`     // Callback is the callback info after upload.
 	CallbackVar string `json:"callback_var"` // CallbackVar are the callback parameters after upload.

@@ -160,7 +160,7 @@ func (ts *TokenSource) refreshToken() error {
 		// Clear token
 		ts.token = nil
 		ts.expiry = time.Time{}
-		err = ts.saveToken()
+		_ = ts.saveToken()
 		return fmt.Errorf("refresh token expired, please run 'rclone config reconnect %s:'", ts.name)
 	}
 
@@ -169,7 +169,7 @@ func (ts *TokenSource) refreshToken() error {
 		// Clear token
 		ts.token = nil
 		ts.expiry = time.Time{}
-		err = ts.saveToken()
+		_ = ts.saveToken()
 		return fmt.Errorf("faild get token from server: %s", resp.Message)
 	}
 
@@ -202,11 +202,11 @@ func (ts *TokenSource) saveToken() error {
 }
 
 // Auth initiates the authorization process using QR code
-func (ts *TokenSource) Auth(appId string) error {
+func (ts *TokenSource) Auth(appID string) error {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	// Get QR code URL
-	authData, err := ts.getAuthURL(ts.ctx, appId)
+	authData, err := ts.getAuthURL(ts.ctx, appID)
 	if err != nil {
 		return err
 	}
@@ -234,7 +234,7 @@ func (ts *TokenSource) Auth(appId string) error {
 }
 
 // getAuthURL generates QR code URL for user scanning
-func (ts *TokenSource) getAuthURL(ctx context.Context, appId string) (authData *api.AuthDeviceCodeData, err error) {
+func (ts *TokenSource) getAuthURL(ctx context.Context, appID string) (authData *api.AuthDeviceCodeData, err error) {
 	// Generate random code verifier
 	codeVerifier := generateCodeVerifier()
 
@@ -246,7 +246,7 @@ func (ts *TokenSource) getAuthURL(ctx context.Context, appId string) (authData *
 		RootURL:     passportAPI,
 		Path:        "/open/authDeviceCode",
 		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(fmt.Sprintf("client_id=%s&code_challenge=%s&code_challenge_method=sha256", appId, codeChallenge)),
+		Body:        strings.NewReader(fmt.Sprintf("client_id=%s&code_challenge=%s&code_challenge_method=sha256", appID, codeChallenge)),
 	}
 	var resp api.AuthDeviceCodeResponse
 	_, err = ts.c.CallJSON(ctx, &opts, nil, &resp)

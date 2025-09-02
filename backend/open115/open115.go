@@ -37,15 +37,16 @@ import (
 )
 
 const (
-	defaultAppId  = "100196955"            // default app id for rclone
+	defaultAppID  = "100196955"            // default app id for rclone
 	minSleep      = 100 * time.Millisecond // minSleep is the minimum sleep time between retries.
 	maxSleep      = 5 * time.Second        // maxSleep is the maximum sleep time between retries.
 	decayConstant = 2                      // decayConstant is the backoff factor.
 	rootID        = "0"                    // rootID is the ID of the root directory.
 	objectDir     = "0"
-	MB            = 1024 * 1024
-	GB            = 1024 * MB
-	TB            = 1024 * GB
+	// MB represents one megabyte in bytes
+	MB = 1024 * 1024
+	GB = 1024 * MB
+	TB = 1024 * GB
 )
 
 // calPartSize calculates the part size for multipart upload based on file size
@@ -788,8 +789,8 @@ func (f *Fs) OAuth(ctx context.Context, name string, m configmap.Mapper, oauthCo
 	if err != nil {
 		return err
 	}
-	appId := opt.AppID
-	return f.tokenSource.Auth(appId)
+	appID := opt.AppID
+	return f.tokenSource.Auth(appID)
 }
 
 // Config handles the configuration process.
@@ -805,10 +806,9 @@ func (f *Fs) Config(ctx context.Context, name string, m configmap.Mapper, config
 		if config.Result == "false" {
 			// User doesn't want to re-authorize, so return empty state
 			return nil, nil
-		} else {
-			// User wants to re-authorize, so proceed to choose auth type
-			return fs.ConfigGoto("choose_auth_type")
 		}
+		// User wants to re-authorize, so proceed to choose auth type
+		return fs.ConfigGoto("choose_auth_type")
 	case "choose_auth_type":
 		return fs.ConfigChooseExclusiveFixed("choose_auth_type_done", "auth_type", "Select authorization type", []fs.OptionExample{
 			{Value: "token", Help: "Authenticate using an existing refresh token"},
@@ -843,11 +843,11 @@ func (f *Fs) Config(ctx context.Context, name string, m configmap.Mapper, config
 		if err != nil {
 			return nil, err
 		}
-		appId := func() string {
+		appID := func() string {
 			if opt.AppID != "" {
 				return opt.AppID
 			}
-			return defaultAppId
+			return defaultAppID
 		}()
 		// Use TokenSource to save token
 		fc := fshttp.NewClient(ctx)
@@ -857,7 +857,7 @@ func (f *Fs) Config(ctx context.Context, name string, m configmap.Mapper, config
 			name: name,
 			m:    m,
 		}
-		err = ts.Auth(appId)
+		err = ts.Auth(appID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to authenticate: %v", err)
 		}
@@ -889,7 +889,7 @@ func parseSignCheckRange(signCheck string) (start, end int64, err error) {
 // uploadToOSS uploads a file to Alibaba Cloud OSS
 func uploadToOSS(ctx context.Context, in io.Reader, initData api.InitUploadData, token api.UploadTokenData) error {
 	// Create OSS client
-	ossClient, err := oss.New(token.Endpoint, token.AccessKeyId, token.AccessKeySecret, oss.SecurityToken(token.SecurityToken))
+	ossClient, err := oss.New(token.Endpoint, token.AccessKeyID, token.AccessKeySecret, oss.SecurityToken(token.SecurityToken))
 	if err != nil {
 		return fmt.Errorf("failed to create OSS client: %w", err)
 	}
@@ -927,7 +927,7 @@ func uploadToOSS(ctx context.Context, in io.Reader, initData api.InitUploadData,
 // Due to some special restrictions on callback by Open115,
 // it seems that parallel multipart uploads are not allowed.
 func uploadMultipartToOSS(ctx context.Context, in io.Reader, initData api.InitUploadData, token api.UploadTokenData, fileSize, chunkSize int64) error {
-	ossClient, err := oss.New(token.Endpoint, token.AccessKeyId, token.AccessKeySecret, oss.SecurityToken(token.SecurityToken))
+	ossClient, err := oss.New(token.Endpoint, token.AccessKeyID, token.AccessKeySecret, oss.SecurityToken(token.SecurityToken))
 	if err != nil {
 		return fmt.Errorf("failed to create OSS client: %w", err)
 	}
