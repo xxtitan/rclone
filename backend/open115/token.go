@@ -230,6 +230,7 @@ func (ts *TokenSource) Auth(appID string) error {
 		return err
 	}
 	ts.token = token
+	fs.Logf(nil, "open115 token successful, token saved to configuration")
 	return ts.saveToken()
 }
 
