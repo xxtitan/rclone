@@ -28,11 +28,13 @@ import (
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"github.com/rclone/rclone/backend/open115/api"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
+	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
 )
 
@@ -107,25 +109,76 @@ func Register(fName string) {
 				Help:     "Refresh Token (use token instead of appid to authorize)",
 				Required: false,
 			},
+			{
+				Name:     config.ConfigEncoding,
+				Help:     config.ConfigEncodingHelp,
+				Advanced: true,
+				// 115 Cloud Drive specific encoding rules
+				// Based on testing and API limitations
+				// 115 does not allow: " \ < >
+				// Also encode leading spaces and control characters as they cause issues
+				Default: encoder.Base |
+					encoder.EncodeBackSlash |
+					encoder.EncodeLeftSpace |
+					encoder.EncodeLeftCrLfHtVt |
+					encoder.EncodeRightSpace |
+					encoder.EncodeInvalidUtf8 |
+					encoder.EncodeDel |
+					encoder.EncodeDoubleQuote |
+					encoder.EncodeLtGt,
+			},
 		},
 	})
 }
 
 // Options defines the configuration for this backend.
 type Options struct {
-	AppID string `config:"app_id"` // AppID is the 115 Open Platform Application ID.
+	AppID string               `config:"app_id"`   // AppID is the 115 Open Platform Application ID.
+	Enc   encoder.MultiEncoder `config:"encoding"` // Enc is the encoding for file names.
 }
 
 // Fs represents an 115 drive file system.
 type Fs struct {
-	name        string             // name is the remote name.
-	root        string             // root is the root path.
-	opt         Options            // opt stores the configuration options.
-	features    *fs.Features       // features caches the optional features.
-	pacer       *fs.Pacer          // pacer is the pacer for this Fs.
-	client      *client            // client is the API client.
-	tokenSource *TokenSource       // tokenSource provides API tokens.
-	dirCache    *dircache.DirCache // dirCache caches directory listings.
+	name           string             // name is the remote name.
+	root           string             // root is the root path.
+	opt            Options            // opt stores the configuration options.
+	features       *fs.Features       // features caches the optional features.
+	pacer          *fs.Pacer          // pacer is the pacer for this Fs.
+	client         *client            // client is the API client.
+	tokenSource    *TokenSource       // tokenSource provides API tokens.
+	dirCache       *dircache.DirCache // dirCache caches directory listings.
+	slashRoot      string             // root with "/" prefix
+	slashRootSlash string             // root with "/" prefix and postfix
+}
+
+// setRoot sets the root directory path and initializes related path variables
+func (f *Fs) setRoot(root string) {
+	f.root = strings.Trim(root, "/")
+	f.slashRoot = "/" + f.root
+	f.slashRootSlash = f.slashRoot
+	if f.root != "" {
+		f.slashRootSlash += "/"
+	}
+}
+
+// rootSlash returns root with a slash on if it is empty, otherwise empty string
+func (f *Fs) rootSlash() string {
+	if f.root == "" {
+		return f.root
+	}
+	return f.root + "/"
+}
+
+// filePath returns a file path (f.root, file) with proper encoding
+func (f *Fs) filePath(file string) string {
+	subPath := path.Join(f.root, file)
+	return f.opt.Enc.FromStandardPath(subPath)
+}
+
+// dirPath returns a directory path (f.root, dir) with proper encoding
+func (f *Fs) dirPath(dir string) string {
+	subPath := path.Join(f.root, dir)
+	return f.opt.Enc.FromStandardPath(subPath)
 }
 
 // Object represents an 115 drive file or directory.
@@ -179,12 +232,15 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	c := newClient(rc, tokenSource)
 	f := &Fs{
-		name:   name,
-		root:   root,
-		opt:    *opt,
-		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
-		client: c,
+		name:        name,
+		root:        root,
+		opt:         *opt,
+		pacer:       fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		client:      c,
+		tokenSource: tokenSource,
 	}
+	// Set up path handling
+	f.setRoot(root)
 	// Set features
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
@@ -192,7 +248,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}).Fill(ctx, f)
 
 	// Create the root directory cache
-	f.dirCache = dircache.New(root, rootID, f)
+	f.dirCache = dircache.New(f.root, rootID, f)
 
 	// Find the current root
 	err = f.dirCache.FindRoot(ctx, false)
@@ -238,7 +294,9 @@ func (f *Fs) FindLeaf(ctx context.Context, directoryID, leafName string) (string
 			return "", false, err
 		}
 		for _, item := range resp.Data {
-			if item.FN == leafName {
+			// Decode the file name from the API response and compare with the requested name
+			decodedName := f.opt.Enc.ToStandardName(item.FN)
+			if decodedName == leafName {
 				return item.FID, item.FC == objectDir, nil // Return ID and whether it's a directory
 			}
 		}
@@ -268,6 +326,9 @@ func (f *Fs) CreateDir(ctx context.Context, dirID, dirName string) (string, erro
 		return "", err
 	}
 
+	if resp.Data == nil {
+		return "", fmt.Errorf("failed to create directory: %s", resp.Error)
+	}
 	return resp.Data.FileID.String(), nil
 }
 
@@ -308,7 +369,9 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 	entries = make([]fs.DirEntry, 0, len(fileList))
 	for _, item := range fileList {
-		remote := path.Join(dir, item.FN)
+		// Decode the file name from the API response
+		decodedName := f.opt.Enc.ToStandardName(item.FN)
+		remote := path.Join(dir, decodedName)
 		if item.FC == objectDir { // Folder
 			// Cache directory ID
 			f.dirCache.Put(remote, item.FID)
@@ -538,7 +601,9 @@ func (o *Object) readMetaData(ctx context.Context) error {
 		}
 		// Search for matching files in the current page
 		for _, item := range resp.Data {
-			if item.FN == leaf {
+			// Decode the file name from the API response and compare with the requested name
+			decodedName := o.fs.opt.Enc.ToStandardName(item.FN)
+			if decodedName == leaf {
 				return o.setMetaData(&item)
 			}
 		}
@@ -685,8 +750,10 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	// If the destination does not exist, decide whether to rename or move
 	if srcDirectoryID == dstDirectoryID {
 		// Rename directory within the same parent
+		// Encode the file name for the API
+		encodedDstLeaf := f.opt.Enc.FromStandardName(dstLeaf)
 		_, err = f.updateFile(ctx, srcID, map[string]string{
-			"file_name": dstLeaf,
+			"file_name": encodedDstLeaf,
 		})
 	} else {
 		// Move to a different parent directory
@@ -812,7 +879,7 @@ func (f *Fs) Config(ctx context.Context, name string, m configmap.Mapper, config
 	case "choose_auth_type":
 		return fs.ConfigChooseExclusiveFixed("choose_auth_type_done", "auth_type", "Select authorization type", []fs.OptionExample{
 			{Value: "token", Help: "Authenticate using an existing refresh token"},
-			{Value: "auth", Help: "Authenticate using your 115 Cloud Open Platform (requires App ID)"},
+			{Value: "auth", Help: "Authenticate with 115 Open Platform QRCode"},
 		})
 	case "choose_auth_type_done":
 		if config.Result == "auth" {
@@ -1100,8 +1167,10 @@ func calculateSHA1FromReadSeeker(rs io.ReadSeeker) (string, error) {
 // initializeUpload initializes the upload process
 func (f *Fs) initializeUpload(ctx context.Context, remote, directoryID string, size int64, fileSHA1 string, reader io.ReadSeeker) (*api.InitUploadData, error) {
 	// Build upload initialization request
+	// Encode the file name for the API
+	encodedFileName := f.opt.Enc.FromStandardName(path.Base(remote))
 	initReq := &api.InitUploadRequest{
-		FileName: path.Base(remote),
+		FileName: encodedFileName,
 		FileSize: size,
 		Target:   "U_1_" + directoryID, // Format: U_1_dirID
 		FileID:   fileSHA1,
@@ -1298,9 +1367,11 @@ func (f *Fs) download(ctx context.Context, url string, options ...fs.OpenOption)
 
 // createFolder creates a new folder.
 func (f *Fs) createFolder(ctx context.Context, pid string, fileName string) (*api.FolderCreateResponse, error) {
+	// Encode the file name for the API
+	encodedFileName := f.opt.Enc.FromStandardName(fileName)
 	values := url.Values{}
 	values.Set("pid", pid)
-	values.Set("file_name", fileName)
+	values.Set("file_name", encodedFileName)
 	opts := rest.Opts{
 		Method:      "POST",
 		RootURL:     baseAPI,

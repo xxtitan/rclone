@@ -153,7 +153,7 @@ type FileListResponse struct {
 // FolderCreateResponse represents the response for creating a folder.
 type FolderCreateResponse struct {
 	Response
-	Data FolderCreateData `json:"data"` // Data contains the created folder information.
+	Data *FolderCreateData `json:"data"` // Data contains the created folder information.
 }
 
 // FolderCreateData holds the data returned after creating a folder.
