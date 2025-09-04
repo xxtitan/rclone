@@ -368,13 +368,13 @@ type UserInfoResponse struct {
 
 // UserInfoData holds the user information data structure.
 type UserInfoData struct {
-	UserID      string    `json:"user_id"`       // UserID is the user identifier
-	UserName    string    `json:"user_name"`     // UserName is the username
-	UserFaceS   string    `json:"user_face_s"`   // UserFaceS is the small-sized user avatar
-	UserFaceM   string    `json:"user_face_m"`   // UserFaceM is the medium-sized user avatar
-	UserFaceL   string    `json:"user_face_l"`   // UserFaceL is the large-sized user avatar
-	RTSpaceInfo SpaceInfo `json:"rt_space_info"` // RTSpaceInfo contains the user's storage space information
-	VipInfo     VipInfo   `json:"vip_info"`      // VipInfo contains the user's VIP level information
+	UserID      json.Number `json:"user_id"`       // UserID is the user identifier
+	UserName    string      `json:"user_name"`     // UserName is the username
+	UserFaceS   string      `json:"user_face_s"`   // UserFaceS is the small-sized user avatar
+	UserFaceM   string      `json:"user_face_m"`   // UserFaceM is the medium-sized user avatar
+	UserFaceL   string      `json:"user_face_l"`   // UserFaceL is the large-sized user avatar
+	RTSpaceInfo SpaceInfo   `json:"rt_space_info"` // RTSpaceInfo contains the user's storage space information
+	VipInfo     VipInfo     `json:"vip_info"`      // VipInfo contains the user's VIP level information
 }
 
 // SpaceInfo represents the user's storage space information.

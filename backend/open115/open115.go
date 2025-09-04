@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/lib/oauthutil"
+	"github.com/rclone/rclone/lib/random"
 
 	"github.com/rclone/rclone/fs/fserrors"
 
@@ -122,6 +123,7 @@ func Register(fName string) {
 					encoder.EncodeLeftSpace |
 					encoder.EncodeLeftCrLfHtVt |
 					encoder.EncodeRightSpace |
+					encoder.EncodeRightCrLfHtVt |
 					encoder.EncodeInvalidUtf8 |
 					encoder.EncodeDel |
 					encoder.EncodeDoubleQuote |
@@ -689,8 +691,37 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 //
 // The new object may have been created if an error is returned.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	// Directly call Put to implement the update functionality
-	newObj, err := o.fs.Put(ctx, in, src, options...)
+	// Check if file exists and remove it if necessary (similar to Put method)
+	existingObj, err := o.fs.NewObject(ctx, o.remote)
+	if err == nil {
+		// File exists, delete it
+		err = existingObj.Remove(ctx)
+		if err != nil {
+			return err
+		}
+	} else if !errors.Is(err, fs.ErrorObjectNotFound) {
+		return err
+	}
+
+	// Use PutUnchecked to upload the file with the original object's path
+	// Get file path and size from src but use the original remote path
+	size := src.Size()
+	modTime := src.ModTime(ctx)
+
+	// Create object and ensure directory exists using the original remote path
+	_, _, directoryID, err := o.fs.createObject(ctx, o.remote, modTime, size)
+	if err != nil {
+		return err
+	}
+
+	// Handle empty files
+	if size == 0 {
+		// Empty file not supported yet
+		return fs.ErrorNotImplemented
+	}
+
+	// Execute file upload with the original remote path
+	newObj, err := o.fs.upload(ctx, in, o.remote, directoryID, size)
 	if err != nil {
 		return err
 	}
@@ -742,27 +773,17 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return fmt.Errorf("can't move directories across different remotes: %w", fs.ErrorCantMove)
 	}
 
-	srcID, srcDirectoryID, _, dstDirectoryID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
+	srcID, srcDirectoryID, srcLeaf, dstDirectoryID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
 	if err != nil {
 		return err
 	}
 
-	// If the destination does not exist, decide whether to rename or move
-	if srcDirectoryID == dstDirectoryID {
-		// Rename directory within the same parent
-		// Encode the file name for the API
-		encodedDstLeaf := f.opt.Enc.FromStandardName(dstLeaf)
-		_, err = f.updateFile(ctx, srcID, map[string]string{
-			"file_name": encodedDstLeaf,
-		})
-	} else {
-		// Move to a different parent directory
-		_, err = f.moveFiles(ctx, []string{srcID}, dstDirectoryID)
-	}
-
+	// Use enhanced move logic for directories
+	err = f.performMoveDirs(ctx, srcDirectoryID, dstDirectoryID, srcLeaf, dstLeaf, []string{srcID})
 	if err != nil {
 		return err
 	}
+
 	// Flush directory cache
 	srcFs.dirCache.FlushDir(srcRemote)
 	return nil
@@ -783,14 +804,28 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, fmt.Errorf("can't copy across different remotes: %w", fs.ErrorCantCopy)
 	}
 
-	// Create the destination object and ensure directory exists
-	_, _, dstDirID, err := f.createObject(ctx, remote, srcObj.modTime, srcObj.size)
+	// Get source directory info
+	srcLeaf, srcDirID, err := f.dirCache.FindPath(ctx, srcObj.remote, false)
 	if err != nil {
 		return nil, err
 	}
 
+	// Create the destination object and ensure directory exists
+	dstLeaf, dstDirID, err := f.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if file extension is changing - Open115 doesn't support this
+	srcExt := path.Ext(srcLeaf)
+	dstExt := path.Ext(dstLeaf)
+	if srcExt != dstExt {
+		fs.Debugf(src, "Can't copy - Open115 doesn't support changing file extensions: %q -> %q", srcExt, dstExt)
+		return nil, fs.ErrorCantCopy
+	}
+
 	// Copy file
-	_, err = f.copyFiles(ctx, dstDirID, []string{srcObj.id}, false)
+	err = f.copyFiles(ctx, srcDirID, dstDirID, srcLeaf, dstLeaf, []string{srcObj.id})
 	if err != nil {
 		return nil, err
 	}
@@ -818,14 +853,28 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, fmt.Errorf("can't move across different remotes: %w", fs.ErrorCantMove)
 	}
 
-	// Create the destination object and ensure directory exists
-	_, _, dstDirID, err := f.createObject(ctx, remote, srcObj.modTime, srcObj.size)
+	// Get source directory info
+	srcLeaf, srcDirID, err := f.dirCache.FindPath(ctx, srcObj.remote, false)
 	if err != nil {
 		return nil, err
 	}
 
-	// Move file
-	_, err = f.moveFiles(ctx, []string{srcObj.id}, dstDirID)
+	// Create the destination object and ensure directory exists
+	dstLeaf, dstDirID, err := f.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if file extension is changing - Open115 doesn't support this
+	srcExt := path.Ext(srcLeaf)
+	dstExt := path.Ext(dstLeaf)
+	if srcExt != dstExt {
+		fs.Debugf(src, "Can't move - Open115 doesn't support changing file extensions: %q -> %q", srcExt, dstExt)
+		return nil, fs.ErrorCantMove
+	}
+
+	// Move file with enhanced logic for different scenarios
+	err = f.performMoveFiles(ctx, srcDirID, dstDirID, srcLeaf, dstLeaf, []string{srcObj.id})
 	if err != nil {
 		return nil, err
 	}
@@ -1515,31 +1564,110 @@ func (f *Fs) updateFile(ctx context.Context, fileID string, options map[string]s
 	return &resp, nil
 }
 
-// copyFiles copies files.
-func (f *Fs) copyFiles(ctx context.Context, pid string, fileIDs []string, noDuplicate bool) (*api.FileOperationResponse, error) {
-	formData := fmt.Sprintf("pid=%s&file_id=%s", pid, strings.Join(fileIDs, ","))
-	if noDuplicate {
-		formData += "&nodupli=1"
+// copyFiles copies files with enhanced logic for different scenarios.
+func (f *Fs) copyFiles(ctx context.Context, srcDirID, dstDirID, srcLeaf, dstLeaf string, fileIDs []string) error {
+	// Decision logic based on source and destination
+	// Case 1: Same directory, same name - no operation needed
+	if srcDirID == dstDirID && srcLeaf == dstLeaf {
+		return nil
 	}
 
-	opts := rest.Opts{
-		Method:      "POST",
-		RootURL:     baseAPI,
-		Path:        "/open/ufile/copy",
-		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(formData),
+	// Case 2: Different directory, same name - direct copy
+	if srcDirID != dstDirID && srcLeaf == dstLeaf {
+		return f.performCopy(ctx, dstDirID, fileIDs)
 	}
 
-	var resp api.FileOperationResponse
-	err := f.pacer.Call(func() (bool, error) {
-		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
-		return shouldRetry(ctx, r, &resp.Response, err)
+	// Case 3: Same directory, different name - use temporary directory approach
+	if srcDirID == dstDirID && srcLeaf != dstLeaf {
+		return f.copyWithTempDir(ctx, srcDirID, dstDirID, dstLeaf, fileIDs)
+	}
+
+	// Case 4: Different directory, different name - use temporary directory approach
+	return f.copyWithTempDir(ctx, srcDirID, dstDirID, dstLeaf, fileIDs)
+}
+
+// performMoveFiles moves files with enhanced logic for different scenarios.
+func (f *Fs) performMoveFiles(ctx context.Context, srcDirID, dstDirID, srcLeaf, dstLeaf string, fileIDs []string) error {
+	// Decision logic based on source and destination
+	// Case 1: Same directory, same name - no operation needed
+	if srcDirID == dstDirID && srcLeaf == dstLeaf {
+		return nil
+	}
+
+	// Case 2: Different directory, same name - direct move
+	if srcDirID != dstDirID && srcLeaf == dstLeaf {
+		_, err := f.moveFiles(ctx, fileIDs, dstDirID)
+		return err
+	}
+
+	// Case 3: Same directory, different name - rename only
+	if srcDirID == dstDirID && srcLeaf != dstLeaf {
+		encodedDstLeaf := f.opt.Enc.FromStandardName(dstLeaf)
+		_, err := f.updateFile(ctx, fileIDs[0], map[string]string{
+			"file_name": encodedDstLeaf,
+		})
+		return err
+	}
+
+	// Case 4: Different directory, different name - move then rename
+	// First move to destination directory
+	_, err := f.moveFiles(ctx, fileIDs, dstDirID)
+	if err != nil {
+		return fmt.Errorf("failed to move file to destination directory: %w", err)
+	}
+
+	// Then rename the file
+	encodedDstLeaf := f.opt.Enc.FromStandardName(dstLeaf)
+	_, err = f.updateFile(ctx, fileIDs[0], map[string]string{
+		"file_name": encodedDstLeaf,
 	})
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to rename moved file: %w", err)
 	}
 
-	return &resp, nil
+	return nil
+}
+
+// performMoveDirs moves directories with enhanced logic for different scenarios.
+func (f *Fs) performMoveDirs(ctx context.Context, srcDirID, dstDirID, srcLeaf, dstLeaf string, dirIDs []string) error {
+	// Decision logic based on source and destination
+	// Case 1: Same directory, same name - no operation needed
+	if srcDirID == dstDirID && srcLeaf == dstLeaf {
+		return nil
+	}
+
+	// Case 2: Different directory, same name - direct move
+	if srcDirID != dstDirID && srcLeaf == dstLeaf {
+		_, err := f.moveFiles(ctx, dirIDs, dstDirID)
+		return err
+	}
+
+	// Case 3: Same directory, different name - rename only
+	if srcDirID == dstDirID && srcLeaf != dstLeaf {
+		encodedDstLeaf := f.opt.Enc.FromStandardName(dstLeaf)
+		_, err := f.updateFile(ctx, dirIDs[0], map[string]string{
+			"file_name": encodedDstLeaf,
+		})
+		return err
+	}
+
+	// Case 4: Different directory, different name - move then rename
+	// First move to destination directory
+	_, err := f.moveFiles(ctx, dirIDs, dstDirID)
+	if err != nil {
+		return fmt.Errorf("failed to move directory to destination: %w", err)
+	}
+
+	// Then rename the directory
+	encodedDstLeaf := f.opt.Enc.FromStandardName(dstLeaf)
+	_, err = f.updateFile(ctx, dirIDs[0], map[string]string{
+		"file_name": encodedDstLeaf,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to rename moved directory: %w", err)
+	}
+
+	return nil
 }
 
 // moveFiles moves files.
@@ -1676,6 +1804,111 @@ func (f *Fs) getUserInfo(ctx context.Context) (*api.UserInfoResponse, error) {
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// copyWithTempDir handles copying within same directory with rename using temporary directory
+func (f *Fs) copyWithTempDir(ctx context.Context, srcDirID, dstDirID, dstLeaf string, fileIDs []string) error {
+	// Generate a unique temporary directory name and create it
+	tmpDir := "rclone-temp-dir-" + random.String(16)
+	tempDirResp, err := f.createFolder(ctx, srcDirID, tmpDir)
+	if err != nil {
+		return fmt.Errorf("failed to create temporary directory: %w", err)
+	}
+	tempDirID := tempDirResp.Data.FileID.String()
+
+	// Ensure cleanup of temporary directory
+	defer func() {
+		if cleanupErr := f.cleanupTempDir(ctx, tempDirID); cleanupErr != nil {
+			fs.Errorf(f, "Failed to cleanup temporary directory %s: %v", tempDirID, cleanupErr)
+		}
+	}()
+
+	// Copy file to temporary directory
+	err = f.performCopy(ctx, tempDirID, fileIDs)
+	if err != nil {
+		return fmt.Errorf("failed to copy to temporary directory: %w", err)
+	}
+
+	// Find the copied file in temporary directory
+	copiedFileID, err := f.findCopiedFile(ctx, tempDirID, fileIDs[0])
+	if err != nil {
+		return fmt.Errorf("failed to find copied file in temporary directory: %w", err)
+	}
+
+	// Rename the copied file
+	encodedDstLeaf := f.opt.Enc.FromStandardName(dstLeaf)
+	_, err = f.updateFile(ctx, copiedFileID, map[string]string{
+		"file_name": encodedDstLeaf,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to rename copied file: %w", err)
+	}
+
+	// Move the renamed file to destination directory
+	_, err = f.moveFiles(ctx, []string{copiedFileID}, dstDirID)
+	if err != nil {
+		return fmt.Errorf("failed to move renamed file to destination: %w", err)
+	}
+
+	return nil
+}
+
+// cleanupTempDir removes the temporary directory and any remaining files
+func (f *Fs) cleanupTempDir(ctx context.Context, tempDirID string) error {
+	// Delete the temporary directory (this should also delete any remaining files)
+	_, err := f.deleteFiles(ctx, []string{tempDirID}, "")
+	return err
+}
+
+// performCopy executes the actual copy operation via API
+func (f *Fs) performCopy(ctx context.Context, pid string, fileIDs []string) error {
+	// Use proper form data encoding
+	values := url.Values{}
+	values.Set("pid", pid)
+	values.Set("file_id", strings.Join(fileIDs, ","))
+	opts := rest.Opts{
+		Method:      "POST",
+		RootURL:     baseAPI,
+		Path:        "/open/ufile/copy",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        strings.NewReader(values.Encode()),
+	}
+
+	var resp api.FileOperationResponse
+	err := f.pacer.Call(func() (bool, error) {
+		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
+		return shouldRetry(ctx, r, &resp.Response, err)
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// findCopiedFile finds the newly copied file by comparing with the source file ID
+func (f *Fs) findCopiedFile(ctx context.Context, dstDirID string, srcFileID string) (string, error) {
+	// Get file list in destination directory
+	resp, err := f.getFileList(ctx, dstDirID, defaultLimit, 0)
+	if err != nil {
+		return "", err
+	}
+
+	// We need to get the source file's SHA1 for comparison
+	srcFileInfo, err := f.getFileInfo(ctx, srcFileID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get source file info: %w", err)
+	}
+
+	// Look for files with matching SHA1
+	for _, item := range resp.Data {
+		if item.FC != objectDir && // Not a directory
+			strings.EqualFold(item.SHA1, srcFileInfo.Data.SHA1) { // Same SHA1
+			return item.FID, nil
+		}
+	}
+
+	return "", fmt.Errorf("copied file not found in destination directory")
 }
 
 // getNormalizedPath splits a path into a parent and a leaf.

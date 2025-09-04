@@ -14,8 +14,7 @@ const (
 	baseAPI          = "https://proapi.115.com"
 	passportAPI      = "https://passportapi.115.com"
 	qrcodeAPI        = "https://qrcodeapi.115.com"
-	defaultRateLimit = 3    // Default rate limit for API calls
-	defaultBurst     = 5    // Default burst size for rate limiting
+	defaultRateLimit = 4    // Default rate limit for API calls
 	defaultLimit     = 1000 // Default limit for listing items
 )
 
@@ -40,7 +39,7 @@ func newClient(rc *rest.Client, ts *TokenSource) *client {
 	return &client{
 		Client:  rc,
 		ts:      ts,
-		limiter: rate.NewLimiter(rate.Limit(defaultRateLimit), defaultBurst),
+		limiter: rate.NewLimiter(rate.Limit(defaultRateLimit), defaultRateLimit),
 	}
 }
 
