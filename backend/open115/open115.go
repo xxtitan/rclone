@@ -1392,9 +1392,13 @@ func shouldRetry(ctx context.Context, res *http.Response, resp *api.Response, er
 	if fserrors.ContextError(ctx, &err) {
 		return false, err
 	}
-	if resp != nil && resp.Errno != 0 {
+
+	if resp != nil && resp.Code == internalErrorCode {
+		return true, err
+	} else if resp != nil && resp.Errno != 0 {
 		return false, fserrors.NoRetryError(fmt.Errorf("API error: code=%d, message=%s", resp.Errno, resp.Error))
 	}
+
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(res, retryErrorCodes), err
 }
 

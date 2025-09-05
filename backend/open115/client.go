@@ -11,13 +11,15 @@ import (
 )
 
 const (
-	baseAPI          = "https://proapi.115.com"
-	passportAPI      = "https://passportapi.115.com"
-	qrcodeAPI        = "https://qrcodeapi.115.com"
-	defaultRateLimit = 4    // Default rate limit for API calls
-	defaultLimit     = 1000 // Default limit for listing items
+	baseAPI           = "https://proapi.115.com"
+	passportAPI       = "https://passportapi.115.com"
+	qrcodeAPI         = "https://qrcodeapi.115.com"
+	defaultRateLimit  = 4    // Default rate limit for API calls
+	defaultLimit      = 1000 // Default limit for listing items
+	internalErrorCode = 1001 // Open115 internal error code
 )
 
+// retryErrorCodes are HTTP status codes that we should retry on.
 var retryErrorCodes = []int{
 	429, // Too Many Requests.
 	500, // Internal Server Error
