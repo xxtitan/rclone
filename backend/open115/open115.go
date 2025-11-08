@@ -482,9 +482,7 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 
 	// Handle empty files
 	if size == 0 {
-		// Empty file handling logic
-		// TO DO: Implement API for empty file creation
-		return nil, fs.ErrorNotImplemented
+		return nil, fs.ErrorCantUploadEmptyFiles
 	}
 
 	// Execute file upload
@@ -716,8 +714,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	// Handle empty files
 	if size == 0 {
-		// Empty file not supported yet
-		return fs.ErrorNotImplemented
+		return fs.ErrorCantUploadEmptyFiles
 	}
 
 	// Execute file upload with the original remote path
@@ -1318,7 +1315,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, remote string,
 
 	// Handle empty files
 	if size == 0 {
-		return nil, fs.ErrorNotImplemented
+		return nil, fs.ErrorCantUploadEmptyFiles
 	}
 
 	// Prepare file for upload
