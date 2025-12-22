@@ -1133,14 +1133,24 @@ func (f *ReadSeekerFile) Close() error {
 	return nil
 }
 
+// isActuallySeekable tests if a ReadSeeker is actually usable by attempting a Seek operation
+func isActuallySeekable(rs io.ReadSeeker) bool {
+	_, err := rs.Seek(0, io.SeekCurrent)
+	return err == nil
+}
+
 // getIOReadSeekerFromReader attempts to get an io.ReadSeeker from an io.Reader
 func getIOReadSeekerFromReader(in io.Reader, size int64) (rs io.ReadSeeker, cleanup func(), err error) {
 	// Empty cleanup function
 	cleanup = func() {}
 
-	// Check if already a ReadSeeker
+	// Check if already a ReadSeeker and verify it's actually seekable
 	if rs, ok := in.(io.ReadSeeker); ok {
-		return rs, cleanup, nil
+		if isActuallySeekable(rs) {
+			return rs, cleanup, nil
+		}
+		// ReadSeeker interface exists but Seek doesn't work (e.g., *asyncreader.AsyncReader wrapped in *accounting.Account)
+		// Fall through to temporary file approach
 	}
 
 	// Create temporary file
