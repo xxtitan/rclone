@@ -5,18 +5,60 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 )
 
+// ResponseState is a bool-like API state value.
+type ResponseState bool
+
+// UnmarshalJSON accepts both boolean and 0/1 state values.
+func (s *ResponseState) UnmarshalJSON(data []byte) error {
+	value := strings.TrimSpace(string(data))
+	switch value {
+	case "true", "1":
+		*s = true
+		return nil
+	case "false", "0":
+		*s = false
+		return nil
+	}
+
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		switch strings.ToLower(strings.TrimSpace(text)) {
+		case "true", "1":
+			*s = true
+			return nil
+		case "false", "0":
+			*s = false
+			return nil
+		}
+	}
+
+	number, err := strconv.ParseInt(value, 10, 64)
+	if err == nil {
+		*s = number != 0
+		return nil
+	}
+
+	return fmt.Errorf("invalid response state %q", value)
+}
+
+// Bool returns the boolean value of the response state.
+func (s ResponseState) Bool() bool {
+	return bool(s)
+}
+
 // Response represents the basic API response structure.
 type Response struct {
-	State   *bool  `json:"state,omitempty"`   // State indicates whether the request succeeded.
-	Code    int    `json:"code,omitempty"`    // Code is the return code.
-	Message string `json:"message,omitempty"` // Message is the return message.
-	Error   string `json:"error,omitempty"`   // Error is the error message.
-	Errno   int    `json:"errno,omitempty"`   // Errno is the error number.
-	Request string `json:"request,omitempty"` // Request is the API request path.
+	State   *ResponseState `json:"state,omitempty"`   // State indicates whether the request succeeded.
+	Code    int            `json:"code,omitempty"`    // Code is the return code.
+	Message string         `json:"message,omitempty"` // Message is the return message.
+	Error   string         `json:"error,omitempty"`   // Error is the error message.
+	Errno   int            `json:"errno,omitempty"`   // Errno is the error number.
+	Request string         `json:"request,omitempty"` // Request is the API request path.
 }
 
 // Success reports whether the API response represents a successful request.
@@ -24,7 +66,7 @@ func (r *Response) Success() bool {
 	if r == nil {
 		return true
 	}
-	return r.Errno == 0 && r.Code == 0 && (r.State == nil || *r.State)
+	return r.Errno == 0 && r.Code == 0 && (r.State == nil || r.State.Bool())
 }
 
 // ErrorDetails formats the available API failure details.
@@ -34,7 +76,7 @@ func (r *Response) ErrorDetails() string {
 	}
 	parts := make([]string, 0, 6)
 	if r.State != nil {
-		parts = append(parts, fmt.Sprintf("state=%t", *r.State))
+		parts = append(parts, fmt.Sprintf("state=%t", r.State.Bool()))
 	}
 	if r.Code != 0 {
 		parts = append(parts, fmt.Sprintf("code=%d", r.Code))

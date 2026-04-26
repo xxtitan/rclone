@@ -167,20 +167,17 @@ func (ts *TokenSource) refreshToken() error {
 	}
 	// Check if token expired
 	if resp.Code == errorCodeRefreshTokenExpired || resp.Code == errorCodeRefreshTokenInvalid || resp.Code == errorCodeNoAuth {
-		// Clear token
-		ts.token = nil
-		ts.expiry = time.Time{}
-		_ = ts.saveToken()
-		return fmt.Errorf("refresh token expired, please run 'rclone config reconnect %s:'", ts.name)
+		_ = ts.clearToken(true)
+		return fmt.Errorf("refresh token expired or invalid: %s; please run 'rclone config reconnect %s:'", resp.ErrorDetails(), ts.name)
 	}
 
 	// Check if response is valid
-	if !resp.Success() || resp.Data.AccessToken == "" || resp.Data.RefreshToken == "" {
-		// Clear token
-		ts.token = nil
-		ts.expiry = time.Time{}
-		_ = ts.saveToken()
+	if !resp.Success() {
 		return fmt.Errorf("failed to get token from server: %s", resp.ErrorDetails())
+	}
+	if resp.Data.AccessToken == "" || resp.Data.RefreshToken == "" {
+		_ = ts.clearToken(false)
+		return fmt.Errorf("failed to get token from server: missing token data")
 	}
 
 	// Update token
@@ -194,6 +191,15 @@ func (ts *TokenSource) refreshToken() error {
 		return fmt.Errorf("failed to save token: %v", err)
 	}
 	return nil
+}
+
+func (ts *TokenSource) clearToken(clearRefreshToken bool) error {
+	ts.token = nil
+	ts.expiry = time.Time{}
+	if clearRefreshToken {
+		ts.m.Set("refresh_token", "")
+	}
+	return ts.saveToken()
 }
 
 // saveToken saves token to configuration

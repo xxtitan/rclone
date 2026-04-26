@@ -286,6 +286,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Find the current root
 	err = f.dirCache.FindRoot(ctx, false)
 	if err != nil {
+		if !errors.Is(err, fs.ErrorDirNotFound) {
+			return nil, err
+		}
 		// Assume it is a file
 		newRoot, remote := dircache.SplitPath(root)
 		tempF := *f
@@ -294,6 +297,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		// Make new Fs which is the parent
 		err = tempF.dirCache.FindRoot(ctx, false)
 		if err != nil {
+			if !errors.Is(err, fs.ErrorDirNotFound) {
+				return nil, err
+			}
 			// No root so return old f
 			return f, nil
 		}
