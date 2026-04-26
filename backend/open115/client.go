@@ -11,16 +11,17 @@ import (
 )
 
 const (
-	baseAPI           = "https://proapi.115.com"
-	passportAPI       = "https://passportapi.115.com"
-	qrcodeAPI         = "https://qrcodeapi.115.com"
-	defaultRateLimit  = 4    // Default rate limit for API calls
-	defaultLimit      = 1000 // Default limit for listing items
-	internalErrorCode = 1001 // Open115 internal error code
+	baseAPI                     = "https://proapi.115.com"
+	passportAPI                 = "https://passportapi.115.com"
+	qrcodeAPI                   = "https://qrcodeapi.115.com"
+	defaultAPIRequestsPerSecond = 2    // Default requests per second for API calls.
+	defaultListPageSize         = 1000 // Default page size for listing items.
+	open115InternalErrorCode    = 1001 // Open115 internal error code.
+	open115AccessLimitCode      = 770004
 )
 
-// retryErrorCodes are HTTP status codes that we should retry on.
-var retryErrorCodes = []int{
+// retryHTTPStatusCodes are HTTP status codes that we should retry on.
+var retryHTTPStatusCodes = []int{
 	429, // Too Many Requests.
 	500, // Internal Server Error
 	502, // Bad Gateway
@@ -41,7 +42,7 @@ func newClient(rc *rest.Client, ts *TokenSource) *client {
 	return &client{
 		Client:  rc,
 		ts:      ts,
-		limiter: rate.NewLimiter(rate.Limit(defaultRateLimit), defaultRateLimit),
+		limiter: rate.NewLimiter(rate.Limit(defaultAPIRequestsPerSecond), defaultAPIRequestsPerSecond),
 	}
 }
 

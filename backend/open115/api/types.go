@@ -5,15 +5,56 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 )
 
 // Response represents the basic API response structure.
 type Response struct {
+	State   *bool  `json:"state,omitempty"`   // State indicates whether the request succeeded.
 	Code    int    `json:"code,omitempty"`    // Code is the return code.
 	Message string `json:"message,omitempty"` // Message is the return message.
 	Error   string `json:"error,omitempty"`   // Error is the error message.
 	Errno   int    `json:"errno,omitempty"`   // Errno is the error number.
+	Request string `json:"request,omitempty"` // Request is the API request path.
+}
+
+// Success reports whether the API response represents a successful request.
+func (r *Response) Success() bool {
+	if r == nil {
+		return true
+	}
+	return r.Errno == 0 && r.Code == 0 && (r.State == nil || *r.State)
+}
+
+// ErrorDetails formats the available API failure details.
+func (r *Response) ErrorDetails() string {
+	if r == nil {
+		return "API error"
+	}
+	parts := make([]string, 0, 6)
+	if r.State != nil {
+		parts = append(parts, fmt.Sprintf("state=%t", *r.State))
+	}
+	if r.Code != 0 {
+		parts = append(parts, fmt.Sprintf("code=%d", r.Code))
+	}
+	if r.Errno != 0 {
+		parts = append(parts, fmt.Sprintf("errno=%d", r.Errno))
+	}
+	if r.Message != "" {
+		parts = append(parts, "message="+r.Message)
+	}
+	if r.Error != "" {
+		parts = append(parts, "error="+r.Error)
+	}
+	if r.Request != "" {
+		parts = append(parts, "request="+r.Request)
+	}
+	if len(parts) == 0 {
+		return "API error"
+	}
+	return strings.Join(parts, ", ")
 }
 
 // AuthDeviceCodeResponse represents the response for device code authorization.

@@ -2,7 +2,6 @@
 package open115
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
@@ -15,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -40,33 +40,32 @@ import (
 )
 
 const (
-	defaultAppID  = "100196955"            // default app id for rclone
-	minSleep      = 100 * time.Millisecond // minSleep is the minimum sleep time between retries.
-	maxSleep      = 5 * time.Second        // maxSleep is the maximum sleep time between retries.
-	decayConstant = 2                      // decayConstant is the backoff factor.
-	rootID        = "0"                    // rootID is the ID of the root directory.
-	objectDir     = "0"
-	// MB represents one megabyte in bytes
-	MB = 1024 * 1024
-	GB = 1024 * MB
-	TB = 1024 * GB
+	defaultAppID       = "100196955"            // default app id for rclone
+	minSleep           = 100 * time.Millisecond // minSleep is the minimum sleep time between retries.
+	maxSleep           = 5 * time.Second        // maxSleep is the maximum sleep time between retries.
+	decayConstant      = 2                      // decayConstant is the backoff factor.
+	rootID             = "0"                    // rootID is the ID of the root directory.
+	fileCategoryFolder = "0"
+	mib                = 1024 * 1024
+	gib                = 1024 * mib
+	tib                = 1024 * gib
 )
 
 // calPartSize calculates the part size for multipart upload based on file size
 func calPartSize(fileSize int64) int64 {
-	var partSize int64 = 20 * MB
+	var partSize int64 = 20 * mib
 	if fileSize > partSize {
-		if fileSize > 1*TB { // file Size over 1TB
-			partSize = 5 * GB // file part size 5GB
-		} else if fileSize > 768*GB { // over 768GB
+		if fileSize > 1*tib { // file Size over 1TB
+			partSize = 5 * gib // file part size 5GB
+		} else if fileSize > 768*gib { // over 768GB
 			partSize = 109951163 // ≈ 104.8576MB, split 1TB into 10,000 part
-		} else if fileSize > 512*GB { // over 512GB
+		} else if fileSize > 512*gib { // over 512GB
 			partSize = 82463373 // ≈ 78.6432MB
-		} else if fileSize > 384*GB { // over 384GB
+		} else if fileSize > 384*gib { // over 384GB
 			partSize = 54975582 // ≈ 52.4288MB
-		} else if fileSize > 256*GB { // over 256GB
+		} else if fileSize > 256*gib { // over 256GB
 			partSize = 41231687 // ≈ 39.3216MB
-		} else if fileSize > 128*GB { // over 128GB
+		} else if fileSize > 128*gib { // over 128GB
 			partSize = 27487791 // ≈ 26.2144MB
 		}
 	}
@@ -135,8 +134,9 @@ func Register(fName string) {
 
 // Options defines the configuration for this backend.
 type Options struct {
-	AppID string               `config:"app_id"`   // AppID is the 115 Open Platform Application ID.
-	Enc   encoder.MultiEncoder `config:"encoding"` // Enc is the encoding for file names.
+	AppID        string               `config:"app_id"`        // AppID is the 115 Open Platform Application ID.
+	RefreshToken string               `config:"refresh_token"` // RefreshToken is an optional refresh token.
+	Enc          encoder.MultiEncoder `config:"encoding"`      // Enc is the encoding for file names.
 }
 
 // Fs represents an 115 drive file system.
@@ -193,6 +193,37 @@ type Object struct {
 	sha1        string    // sha1 is the SHA1 hash.
 	pickCode    string    // pickCode is the file pick code.
 	hasMetaData bool      // hasMetaData indicates if metadata has been set.
+}
+
+func objectID(obj fs.Object) string {
+	if obj == nil {
+		return ""
+	}
+	if o, ok := obj.(*Object); ok {
+		return o.id
+	}
+	return ""
+}
+
+func removePreviousObjectAfterUpload(ctx context.Context, previous, current fs.Object) error {
+	if previous == nil {
+		return nil
+	}
+	previousID := objectID(previous)
+	currentID := objectID(current)
+	if previousID == "" {
+		return errors.New("failed to remove previous object after successful upload: previous object id is empty")
+	}
+	if currentID == "" {
+		return errors.New("failed to remove previous object after successful upload: uploaded object id is empty")
+	}
+	if previousID == currentID {
+		return nil
+	}
+	if err := previous.Remove(ctx); err != nil {
+		return fmt.Errorf("failed to remove previous object after successful upload: %w", err)
+	}
+	return nil
 }
 
 // ------------------------------------------------------------
@@ -291,7 +322,7 @@ func (f *Fs) FindLeaf(ctx context.Context, directoryID, leafName string) (string
 
 	var nextOffset = 0
 	for {
-		resp, err := f.getFileList(ctx, directoryID, defaultLimit, nextOffset)
+		resp, err := f.getFileList(ctx, directoryID, defaultListPageSize, nextOffset)
 		if err != nil {
 			return "", false, err
 		}
@@ -299,14 +330,14 @@ func (f *Fs) FindLeaf(ctx context.Context, directoryID, leafName string) (string
 			// Decode the file name from the API response and compare with the requested name
 			decodedName := f.opt.Enc.ToStandardName(item.FN)
 			if decodedName == leafName {
-				return item.FID, item.FC == objectDir, nil // Return ID and whether it's a directory
+				return item.FID, item.FC == fileCategoryFolder, nil // Return ID and whether it's a directory
 			}
 		}
 		// If the returned count is less than the requested count, we have reached the end.
-		if len(resp.Data) < defaultLimit {
+		if len(resp.Data) < defaultListPageSize {
 			break
 		}
-		nextOffset += defaultLimit
+		nextOffset += defaultListPageSize
 	}
 	return "", false, nil
 }
@@ -329,7 +360,7 @@ func (f *Fs) CreateDir(ctx context.Context, dirID, dirName string) (string, erro
 	}
 
 	if resp.Data == nil {
-		return "", fmt.Errorf("failed to create directory: %s", resp.Error)
+		return "", fmt.Errorf("failed to create directory: %s", resp.Response.ErrorDetails())
 	}
 	return resp.Data.FileID.String(), nil
 }
@@ -354,7 +385,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 	// Get all files page by page
 	for {
-		resp, err := f.getFileList(ctx, directoryID, defaultLimit, nextOffset)
+		resp, err := f.getFileList(ctx, directoryID, defaultListPageSize, nextOffset)
 		if err != nil {
 			return nil, err
 		}
@@ -362,11 +393,11 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		fileList = append(fileList, resp.Data...)
 
 		// If the returned count is less than the requested count, we have reached the end.
-		if len(resp.Data) < defaultLimit {
+		if len(resp.Data) < defaultListPageSize {
 			break
 		}
 
-		nextOffset += defaultLimit
+		nextOffset += defaultListPageSize
 	}
 
 	entries = make([]fs.DirEntry, 0, len(fileList))
@@ -374,7 +405,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		// Decode the file name from the API response
 		decodedName := f.opt.Enc.ToStandardName(item.FN)
 		remote := path.Join(dir, decodedName)
-		if item.FC == objectDir { // Folder
+		if item.FC == fileCategoryFolder { // Folder
 			// Cache directory ID
 			f.dirCache.Put(remote, item.FID)
 			d := fs.NewDir(remote, time.Unix(int64(item.UPT), 0))
@@ -445,20 +476,21 @@ func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time,
 //
 // It returns the object created and an error, if any.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	// Check if file exists and remove it if necessary
 	existingObj, err := f.NewObject(ctx, src.Remote())
-	if err == nil {
-		// File exists, delete it
-		err = existingObj.Remove(ctx)
-		if err != nil {
-			return nil, err
-		}
-	} else if !errors.Is(err, fs.ErrorObjectNotFound) {
+	if err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
 		return nil, err
 	}
 
-	// Use PutUnchecked to upload the file
-	return f.PutUnchecked(ctx, in, src, options...)
+	newObj, err := f.PutUnchecked(ctx, in, src, options...)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := removePreviousObjectAfterUpload(ctx, existingObj, newObj); err != nil {
+		return newObj, err
+	}
+
+	return newObj, nil
 }
 
 // PutUnchecked uploads the object without checking if it exists
@@ -560,7 +592,7 @@ func (o *Object) ID() string {
 // setMetaData sets the metadata from info.
 func (o *Object) setMetaData(info *api.FileInfo) error {
 	// Ensure it's not a directory
-	if info.FC == objectDir {
+	if info.FC == fileCategoryFolder {
 		return fs.ErrorIsDir
 	}
 
@@ -595,7 +627,7 @@ func (o *Object) readMetaData(ctx context.Context) error {
 	}
 	var nextOffset = 0
 	for {
-		resp, err := o.fs.getFileList(ctx, directoryID, defaultLimit, nextOffset)
+		resp, err := o.fs.getFileList(ctx, directoryID, defaultListPageSize, nextOffset)
 		if err != nil {
 			return err
 		}
@@ -608,11 +640,11 @@ func (o *Object) readMetaData(ctx context.Context) error {
 			}
 		}
 		// If the returned count is less than the requested limit, it means we've reached the last page
-		if len(resp.Data) < defaultLimit {
+		if len(resp.Data) < defaultListPageSize {
 			break
 		}
 		// Update the offset for the next page
-		nextOffset += defaultLimit
+		nextOffset += defaultListPageSize
 	}
 	return fs.ErrorObjectNotFound
 }
@@ -662,6 +694,8 @@ func (o *Object) Storable() bool {
 //
 // See Open in the Object interface for documentation.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	fs.FixRangeOption(options, o.size)
+
 	// Get download URL
 	resp, err := o.fs.getFileDownloadURL(ctx, o.pickCode)
 	if err != nil {
@@ -689,15 +723,8 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 //
 // The new object may have been created if an error is returned.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	// Check if file exists and remove it if necessary (similar to Put method)
 	existingObj, err := o.fs.NewObject(ctx, o.remote)
-	if err == nil {
-		// File exists, delete it
-		err = existingObj.Remove(ctx)
-		if err != nil {
-			return err
-		}
-	} else if !errors.Is(err, fs.ErrorObjectNotFound) {
+	if err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
 		return err
 	}
 
@@ -727,6 +754,11 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	newO, ok := newObj.(*Object)
 	if !ok {
 		return fmt.Errorf("object returned is of wrong type")
+	}
+
+	if err := removePreviousObjectAfterUpload(ctx, existingObj, newO); err != nil {
+		*o = *newO
+		return err
 	}
 
 	// Copy properties from the new object
@@ -903,16 +935,52 @@ func (f *Fs) OAuth(ctx context.Context, name string, m configmap.Mapper, oauthCo
 		return err
 	}
 	appID := opt.AppID
-	return f.tokenSource.Auth(appID)
+	if appID == "" {
+		appID = defaultAppID
+	}
+	tokenSource := f.tokenSource
+	if tokenSource == nil {
+		fc := fshttp.NewClient(ctx)
+		tokenSource = &TokenSource{
+			c:    rest.NewClient(fc),
+			ctx:  ctx,
+			name: name,
+			m:    m,
+		}
+	}
+	return tokenSource.Auth(appID)
 }
 
 // Config handles the configuration process.
 func (f *Fs) Config(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
+	if err != nil {
+		return nil, err
+	}
+
 	switch config.State {
 	case "":
 		// Check token exists
 		if _, err := oauthutil.GetToken(name, m); err != nil {
-			return fs.ConfigGoto("choose_auth_type")
+			if opt.RefreshToken == "" {
+				return fs.ConfigGoto("choose_auth_type")
+			}
+			fc := fshttp.NewClient(ctx)
+			ts := &TokenSource{
+				c: rest.NewClient(fc),
+				token: &api.Token{
+					RefreshToken: opt.RefreshToken,
+				},
+				ctx:  ctx,
+				m:    m,
+				name: name,
+			}
+			err := ts.refreshToken()
+			if err != nil {
+				return nil, fmt.Errorf("failed to validate/refresh token: %v", err)
+			}
+			return &fs.ConfigOut{State: ""}, nil
 		}
 		return fs.ConfigConfirm("choose_reauthorize", false, "consent_to_authorize", "Re-authorize for new token?")
 	case "choose_reauthorize":
@@ -951,11 +1019,6 @@ func (f *Fs) Config(ctx context.Context, name string, m configmap.Mapper, config
 		}
 		return &fs.ConfigOut{State: ""}, nil
 	case "authorize":
-		opt := new(Options)
-		err := configstruct.Set(m, opt)
-		if err != nil {
-			return nil, err
-		}
 		appID := func() string {
 			if opt.AppID != "" {
 				return opt.AppID
@@ -1000,7 +1063,7 @@ func parseSignCheckRange(signCheck string) (start, end int64, err error) {
 }
 
 // uploadToOSS uploads a file to Alibaba Cloud OSS
-func uploadToOSS(ctx context.Context, in io.Reader, initData api.InitUploadData, token api.UploadTokenData) error {
+func uploadToOSS(ctx context.Context, in io.Reader, initData api.InitUploadData, token api.UploadTokenData, fileSize int64) error {
 	// Create OSS client
 	ossClient, err := oss.New(token.Endpoint, token.AccessKeyID, token.AccessKeySecret, oss.SecurityToken(token.SecurityToken))
 	if err != nil {
@@ -1023,12 +1086,17 @@ func uploadToOSS(ctx context.Context, in io.Reader, initData api.InitUploadData,
 	callbackVarStr := base64.StdEncoding.EncodeToString([]byte(callback.CallbackVar))
 
 	// Perform upload
-	err = bucket.PutObject(initData.Object, in,
+	uploadReader := &countingReader{r: in}
+	err = bucket.PutObject(initData.Object, uploadReader,
 		oss.Callback(callbackStr),
 		oss.CallbackVar(callbackVarStr),
+		oss.WithContext(ctx),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to upload to OSS: %w", err)
+	}
+	if uploadReader.n != fileSize {
+		return fmt.Errorf("failed to read upload data: read %d bytes, expected %d", uploadReader.n, fileSize)
 	}
 
 	fs.Debugf(nil, "uploaded %s to OSS successfully", initData.Object)
@@ -1055,33 +1123,32 @@ func uploadMultipartToOSS(ctx context.Context, in io.Reader, initData api.InitUp
 	callbackStr := base64.StdEncoding.EncodeToString([]byte(callback.Callback))
 	callbackVarStr := base64.StdEncoding.EncodeToString([]byte(callback.CallbackVar))
 
-	imur, err := bucket.InitiateMultipartUpload(initData.Object, oss.Sequential())
+	imur, err := bucket.InitiateMultipartUpload(initData.Object, oss.Sequential(), oss.WithContext(ctx))
 	if err != nil {
 		return fmt.Errorf("failed to initiate multipart upload: %w", err)
 	}
 
 	partNum := (fileSize + chunkSize - 1) / chunkSize
 	parts := make([]oss.UploadPart, partNum)
-	buf := make([]byte, chunkSize)
 
 	for i := int64(1); i <= partNum; i++ {
 		if ctx.Err() != nil {
-			_ = bucket.AbortMultipartUpload(imur)
+			_ = bucket.AbortMultipartUpload(imur, oss.WithContext(ctx))
 			return ctx.Err()
 		}
 		curSize := chunkSize
 		if i == partNum {
 			curSize = fileSize - (i-1)*chunkSize
 		}
-		n, err := io.ReadFull(in, buf[:curSize])
-		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-			_ = bucket.AbortMultipartUpload(imur)
-			return fmt.Errorf("failed to read part %d data: %w", i, err)
-		}
-		part, err := bucket.UploadPart(imur, bytes.NewReader(buf[:n]), int64(n), int(i))
+		partReader := &countingReader{r: io.LimitReader(in, curSize)}
+		part, err := bucket.UploadPart(imur, partReader, curSize, int(i), oss.WithContext(ctx))
 		if err != nil {
-			_ = bucket.AbortMultipartUpload(imur)
+			_ = bucket.AbortMultipartUpload(imur, oss.WithContext(ctx))
 			return fmt.Errorf("failed to upload part %d: %w", i, err)
+		}
+		if partReader.n != curSize {
+			_ = bucket.AbortMultipartUpload(imur, oss.WithContext(ctx))
+			return fmt.Errorf("failed to read part %d data: read %d bytes, expected %d", i, partReader.n, curSize)
 		}
 		parts[i-1] = part
 	}
@@ -1091,6 +1158,7 @@ func uploadMultipartToOSS(ctx context.Context, in io.Reader, initData api.InitUp
 		parts,
 		oss.Callback(callbackStr),
 		oss.CallbackVar(callbackVarStr),
+		oss.WithContext(ctx),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to complete multipart upload: %w", err)
@@ -1103,6 +1171,17 @@ func uploadMultipartToOSS(ctx context.Context, in io.Reader, initData api.InitUp
 type ReadSeekerFile struct {
 	rs     io.ReadSeeker
 	closed bool
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.n += int64(n)
+	return n, err
 }
 
 // Read implements io.Reader
@@ -1285,10 +1364,10 @@ func (f *Fs) initializeUpload(ctx context.Context, remote, directoryID string, s
 func calculateSHA1Range(r io.Reader, size int64) (string, error) {
 	h := sha1.New()
 	n, err := io.CopyN(h, r, size)
-	if err != nil && err != io.EOF {
-		return "", err
+	if err != nil {
+		return "", fmt.Errorf("failed to read %d bytes, got %d: %w", size, n, err)
 	}
-	if n != size && err != io.EOF {
+	if n != size {
 		return "", fmt.Errorf("failed to read %d bytes, only got %d", size, n)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
@@ -1375,7 +1454,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, remote string,
 	// Choose upload method based on file size
 	if chunkSize >= size {
 		// Use single upload for small files
-		err = uploadToOSS(ctx, reader, *initData, tokenResp.Data)
+		err = uploadToOSS(ctx, reader, *initData, tokenResp.Data, size)
 	} else {
 		// Use multipart upload for large files
 		err = uploadMultipartToOSS(ctx, reader, *initData, tokenResp.Data, size, chunkSize)
@@ -1395,18 +1474,78 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, remote string,
 	})
 }
 
+func encodedForm(values url.Values) string {
+	return values.Encode()
+}
+
+func resetAPIResponse(response any) {
+	if response == nil {
+		return
+	}
+	value := reflect.ValueOf(response)
+	if value.Kind() != reflect.Ptr || value.IsNil() {
+		return
+	}
+	element := value.Elem()
+	if element.CanSet() {
+		element.Set(reflect.Zero(element.Type()))
+	}
+}
+
+func (f *Fs) callAPI(ctx context.Context, opts rest.Opts, response any, apiResp *api.Response) error {
+	return f.pacer.Call(func() (bool, error) {
+		callOpts := opts
+		resetAPIResponse(response)
+		httpResp, err := f.client.CallJSON(ctx, &callOpts, nil, response)
+		return shouldRetry(ctx, httpResp, apiResp, err)
+	})
+}
+
+func (f *Fs) callAPIWithForm(ctx context.Context, opts rest.Opts, form url.Values, response any, apiResp *api.Response) error {
+	encoded := encodedForm(form)
+	opts.ContentType = "application/x-www-form-urlencoded"
+	return f.pacer.Call(func() (bool, error) {
+		callOpts := opts
+		callOpts.Body = strings.NewReader(encoded)
+		resetAPIResponse(response)
+		httpResp, err := f.client.CallJSON(ctx, &callOpts, nil, response)
+		return shouldRetry(ctx, httpResp, apiResp, err)
+	})
+}
+
 func shouldRetry(ctx context.Context, res *http.Response, resp *api.Response, err error) (bool, error) {
 	if fserrors.ContextError(ctx, &err) {
 		return false, err
 	}
 
-	if resp != nil && resp.Code == internalErrorCode {
-		return true, err
-	} else if resp != nil && resp.Errno != 0 {
-		return false, fserrors.NoRetryError(fmt.Errorf("API error: code=%d, message=%s", resp.Errno, resp.Error))
+	if resp != nil && !resp.Success() {
+		err = fmt.Errorf("API error: %s", resp.ErrorDetails())
+		if resp.Code == open115InternalErrorCode {
+			return true, err
+		}
+		if resp.Code == open115AccessLimitCode {
+			return false, fserrors.NoRetryError(err)
+		}
+		return false, fserrors.NoRetryError(err)
 	}
 
-	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(res, retryErrorCodes), err
+	retry := false
+	if res != nil {
+		switch res.StatusCode {
+		case http.StatusTooManyRequests, http.StatusServiceUnavailable:
+			if retryAfterValue := res.Header.Get("Retry-After"); retryAfterValue != "" {
+				retryAfter, parseErr := strconv.Atoi(retryAfterValue)
+				if parseErr != nil {
+					fs.Debugf(nil, "Failed to parse Retry-After: %q: %v", retryAfterValue, parseErr)
+				} else {
+					retry = true
+					err = pacer.RetryAfterError(err, time.Second*time.Duration(retryAfter))
+				}
+			}
+		}
+	}
+
+	return retry || fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(res, retryHTTPStatusCodes), err
 }
 
 // download starts a download from the given URL and returns the response body reader
@@ -1422,7 +1561,13 @@ func (f *Fs) download(ctx context.Context, url string, options ...fs.OpenOption)
 		resp, err = f.client.Call(ctx, &opts)
 		return shouldRetry(ctx, resp, nil, err)
 	})
-	return resp.Body, err
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil || resp.Body == nil {
+		return nil, errors.New("download failed: empty response")
+	}
+	return resp.Body, nil
 }
 
 // createFolder creates a new folder.
@@ -1433,17 +1578,12 @@ func (f *Fs) createFolder(ctx context.Context, pid string, fileName string) (*ap
 	values.Set("pid", pid)
 	values.Set("file_name", encodedFileName)
 	opts := rest.Opts{
-		Method:      "POST",
-		RootURL:     baseAPI,
-		Path:        "/open/folder/add",
-		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(values.Encode()),
+		Method:  "POST",
+		RootURL: baseAPI,
+		Path:    "/open/folder/add",
 	}
 	var resp api.FolderCreateResponse
-	err := f.pacer.Call(func() (bool, error) {
-		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
-		return shouldRetry(ctx, r, &resp.Response, err)
-	})
+	err := f.callAPIWithForm(ctx, opts, values, &resp, &resp.Response)
 	if err != nil {
 		return nil, err
 	}
@@ -1451,12 +1591,12 @@ func (f *Fs) createFolder(ctx context.Context, pid string, fileName string) (*ap
 }
 
 // getFileList gets the list of files and folders.
-func (f *Fs) getFileList(ctx context.Context, cid string, limit, offset int) (*api.FileListResponse, error) {
+func (f *Fs) getFileList(ctx context.Context, parentID string, pageSize, offset int) (*api.FileListResponse, error) {
 
 	// Build query parameters
 	params := url.Values{}
-	params.Set("cid", cid)
-	params.Set("limit", fmt.Sprintf("%d", limit))
+	params.Set("cid", parentID)
+	params.Set("limit", fmt.Sprintf("%d", pageSize))
 	params.Set("offset", fmt.Sprintf("%d", offset))
 	params.Set("cur", "1")
 	params.Set("stdir", "1")
@@ -1468,10 +1608,7 @@ func (f *Fs) getFileList(ctx context.Context, cid string, limit, offset int) (*a
 		Parameters: params,
 	}
 	var resp api.FileListResponse
-	err := f.pacer.Call(func() (bool, error) {
-		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
-		return shouldRetry(ctx, r, &resp.Response, err)
-	})
+	err := f.callAPI(ctx, opts, &resp, &resp.Response)
 	if err != nil {
 		return nil, err
 	}
@@ -1488,10 +1625,7 @@ func (f *Fs) getFileInfo(ctx context.Context, fileID string) (*api.FileInfoRespo
 	}
 
 	var resp api.FileInfoResponse
-	err := f.pacer.Call(func() (bool, error) {
-		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
-		return shouldRetry(ctx, r, &resp.Response, err)
-	})
+	err := f.callAPI(ctx, opts, &resp, &resp.Response)
 	if err != nil {
 		return nil, err
 	}
@@ -1501,19 +1635,16 @@ func (f *Fs) getFileInfo(ctx context.Context, fileID string) (*api.FileInfoRespo
 
 // getFileDownloadURL gets the download URL for a file.
 func (f *Fs) getFileDownloadURL(ctx context.Context, pickCode string) (*api.FileDownloadResponse, error) {
+	formData := url.Values{}
+	formData.Set("pick_code", pickCode)
 	opts := rest.Opts{
-		Method:      "POST",
-		RootURL:     baseAPI,
-		Path:        "/open/ufile/downurl",
-		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(fmt.Sprintf("pick_code=%s", pickCode)),
+		Method:  "POST",
+		RootURL: baseAPI,
+		Path:    "/open/ufile/downurl",
 	}
 
 	var resp api.FileDownloadResponse
-	err := f.pacer.Call(func() (bool, error) {
-		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
-		return shouldRetry(ctx, r, &resp.Response, err)
-	})
+	err := f.callAPIWithForm(ctx, opts, formData, &resp, &resp.Response)
 	if err != nil {
 		return nil, err
 	}
@@ -1523,24 +1654,20 @@ func (f *Fs) getFileDownloadURL(ctx context.Context, pickCode string) (*api.File
 
 // deleteFiles deletes files or folders.
 func (f *Fs) deleteFiles(ctx context.Context, fileIDs []string, parentID string) (*api.FileOperationResponse, error) {
-	formData := fmt.Sprintf("file_ids=%s", strings.Join(fileIDs, ","))
+	formData := url.Values{}
+	formData.Set("file_ids", strings.Join(fileIDs, ","))
 	if parentID != "" {
-		formData += fmt.Sprintf("&parent_id=%s", parentID)
+		formData.Set("parent_id", parentID)
 	}
 
 	opts := rest.Opts{
-		Method:      "POST",
-		RootURL:     baseAPI,
-		Path:        "/open/ufile/delete",
-		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(formData),
+		Method:  "POST",
+		RootURL: baseAPI,
+		Path:    "/open/ufile/delete",
 	}
 
 	var resp api.FileOperationResponse
-	err := f.pacer.Call(func() (bool, error) {
-		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
-		return shouldRetry(ctx, r, &resp.Response, err)
-	})
+	err := f.callAPIWithForm(ctx, opts, formData, &resp, &resp.Response)
 	if err != nil {
 		return nil, err
 	}
@@ -1550,24 +1677,20 @@ func (f *Fs) deleteFiles(ctx context.Context, fileIDs []string, parentID string)
 
 // updateFile updates file information (rename or star).
 func (f *Fs) updateFile(ctx context.Context, fileID string, options map[string]string) (*api.FileUpdateResponse, error) {
-	formData := fmt.Sprintf("file_id=%s", fileID)
+	formData := url.Values{}
+	formData.Set("file_id", fileID)
 	for key, value := range options {
-		formData += fmt.Sprintf("&%s=%s", key, value)
+		formData.Set(key, value)
 	}
 
 	opts := rest.Opts{
-		Method:      "POST",
-		RootURL:     baseAPI,
-		Path:        "/open/ufile/update",
-		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(formData),
+		Method:  "POST",
+		RootURL: baseAPI,
+		Path:    "/open/ufile/update",
 	}
 
 	var resp api.FileUpdateResponse
-	err := f.pacer.Call(func() (bool, error) {
-		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
-		return shouldRetry(ctx, r, &resp.Response, err)
-	})
+	err := f.callAPIWithForm(ctx, opts, formData, &resp, &resp.Response)
 	if err != nil {
 		return nil, err
 	}
@@ -1683,21 +1806,18 @@ func (f *Fs) performMoveDirs(ctx context.Context, srcDirID, dstDirID, srcLeaf, d
 
 // moveFiles moves files.
 func (f *Fs) moveFiles(ctx context.Context, fileIDs []string, toCID string) (*api.FileOperationResponse, error) {
-	formData := fmt.Sprintf("file_ids=%s&to_cid=%s", strings.Join(fileIDs, ","), toCID)
+	formData := url.Values{}
+	formData.Set("file_ids", strings.Join(fileIDs, ","))
+	formData.Set("to_cid", toCID)
 
 	opts := rest.Opts{
-		Method:      "POST",
-		RootURL:     baseAPI,
-		Path:        "/open/ufile/move",
-		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(formData),
+		Method:  "POST",
+		RootURL: baseAPI,
+		Path:    "/open/ufile/move",
 	}
 
 	var resp api.FileOperationResponse
-	err := f.pacer.Call(func() (bool, error) {
-		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
-		return shouldRetry(ctx, r, &resp.Response, err)
-	})
+	err := f.callAPIWithForm(ctx, opts, formData, &resp, &resp.Response)
 	if err != nil {
 		return nil, err
 	}
@@ -1713,10 +1833,7 @@ func (f *Fs) getUploadToken(ctx context.Context) (*api.UploadTokenResponse, erro
 	}
 
 	var resp api.UploadTokenResponse
-	err := f.pacer.Call(func() (bool, error) {
-		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
-		return shouldRetry(ctx, r, &resp.Response, err)
-	})
+	err := f.callAPI(ctx, opts, &resp, &resp.Response)
 	if err != nil {
 		return nil, err
 	}
@@ -1750,18 +1867,13 @@ func (f *Fs) initUpload(ctx context.Context, req *api.InitUploadRequest) (*api.I
 	}
 
 	opts := rest.Opts{
-		Method:      "POST",
-		RootURL:     baseAPI,
-		Path:        "/open/upload/init",
-		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(formData.Encode()),
+		Method:  "POST",
+		RootURL: baseAPI,
+		Path:    "/open/upload/init",
 	}
 
 	var resp api.InitUploadResponse
-	err := f.pacer.Call(func() (bool, error) {
-		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
-		return shouldRetry(ctx, r, &resp.Response, err)
-	})
+	err := f.callAPIWithForm(ctx, opts, formData, &resp, &resp.Response)
 	if err != nil {
 		return nil, err
 	}
@@ -1779,18 +1891,13 @@ func (f *Fs) resumeUpload(ctx context.Context, req *api.ResumeUploadRequest) (*a
 	formData.Set("pick_code", req.PickCode)
 
 	opts := rest.Opts{
-		Method:      "POST",
-		RootURL:     baseAPI,
-		Path:        "/open/upload/resume",
-		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(formData.Encode()),
+		Method:  "POST",
+		RootURL: baseAPI,
+		Path:    "/open/upload/resume",
 	}
 
 	var resp api.ResumeUploadResponse
-	err := f.pacer.Call(func() (bool, error) {
-		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
-		return shouldRetry(ctx, r, &resp.Response, err)
-	})
+	err := f.callAPIWithForm(ctx, opts, formData, &resp, &resp.Response)
 	if err != nil {
 		return nil, err
 	}
@@ -1807,10 +1914,7 @@ func (f *Fs) getUserInfo(ctx context.Context) (*api.UserInfoResponse, error) {
 	}
 
 	var resp api.UserInfoResponse
-	err := f.pacer.Call(func() (bool, error) {
-		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
-		return shouldRetry(ctx, r, &resp.Response, err)
-	})
+	err := f.callAPI(ctx, opts, &resp, &resp.Response)
 	if err != nil {
 		return nil, err
 	}
@@ -1878,18 +1982,13 @@ func (f *Fs) performCopy(ctx context.Context, pid string, fileIDs []string) erro
 	values.Set("pid", pid)
 	values.Set("file_id", strings.Join(fileIDs, ","))
 	opts := rest.Opts{
-		Method:      "POST",
-		RootURL:     baseAPI,
-		Path:        "/open/ufile/copy",
-		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(values.Encode()),
+		Method:  "POST",
+		RootURL: baseAPI,
+		Path:    "/open/ufile/copy",
 	}
 
 	var resp api.FileOperationResponse
-	err := f.pacer.Call(func() (bool, error) {
-		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
-		return shouldRetry(ctx, r, &resp.Response, err)
-	})
+	err := f.callAPIWithForm(ctx, opts, values, &resp, &resp.Response)
 	if err != nil {
 		return err
 	}
@@ -1900,7 +1999,7 @@ func (f *Fs) performCopy(ctx context.Context, pid string, fileIDs []string) erro
 // findCopiedFile finds the newly copied file by comparing with the source file ID
 func (f *Fs) findCopiedFile(ctx context.Context, dstDirID string, srcFileID string) (string, error) {
 	// Get file list in destination directory
-	resp, err := f.getFileList(ctx, dstDirID, defaultLimit, 0)
+	resp, err := f.getFileList(ctx, dstDirID, defaultListPageSize, 0)
 	if err != nil {
 		return "", err
 	}
@@ -1913,7 +2012,7 @@ func (f *Fs) findCopiedFile(ctx context.Context, dstDirID string, srcFileID stri
 
 	// Look for files with matching SHA1
 	for _, item := range resp.Data {
-		if item.FC != objectDir && // Not a directory
+		if item.FC != fileCategoryFolder && // Not a directory
 			strings.EqualFold(item.SHA1, srcFileInfo.Data.SHA1) { // Same SHA1
 			return item.FID, nil
 		}

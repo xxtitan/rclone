@@ -80,7 +80,14 @@ func NewTokenSource(ctx context.Context, name string, m configmap.Mapper, client
 func (ts *TokenSource) readToken() error {
 	tokenJSON, found := ts.m.Get(config.ConfigToken)
 	if !found || tokenJSON == "" {
-		return fmt.Errorf("token not found, please run 'rclone config reconnect %s:'", ts.name)
+		refreshToken, refreshTokenFound := ts.m.Get("refresh_token")
+		if !refreshTokenFound || refreshToken == "" {
+			return fmt.Errorf("token not found, please run 'rclone config reconnect %s:'", ts.name)
+		}
+		ts.token = &api.Token{
+			RefreshToken: refreshToken,
+		}
+		return ts.refreshToken()
 	}
 
 	token := &api.Token{}
@@ -143,14 +150,17 @@ func (ts *TokenSource) refreshToken() error {
 	if ts.token == nil || ts.token.RefreshToken == "" {
 		return fmt.Errorf("no valid refresh token, please run 'rclone config reconnect %s:'", ts.name)
 	}
+	formData := url.Values{}
+	formData.Set("refresh_token", ts.token.RefreshToken)
 	opts := rest.Opts{
 		Method:      "POST",
 		RootURL:     passportAPI,
 		Path:        "/open/refreshToken",
 		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(fmt.Sprintf("refresh_token=%s", ts.token.RefreshToken)),
+		Body:        strings.NewReader(encodedForm(formData)),
 	}
 	var resp api.TokenResponse
+	resetAPIResponse(&resp)
 	_, err := ts.c.CallJSON(ts.ctx, &opts, nil, &resp)
 	if err != nil {
 		return fmt.Errorf("failed to refresh token: %v", err)
@@ -165,12 +175,12 @@ func (ts *TokenSource) refreshToken() error {
 	}
 
 	// Check if response is valid
-	if resp.Code != 0 || resp.Data.AccessToken == "" || resp.Data.RefreshToken == "" {
+	if !resp.Success() || resp.Data.AccessToken == "" || resp.Data.RefreshToken == "" {
 		// Clear token
 		ts.token = nil
 		ts.expiry = time.Time{}
 		_ = ts.saveToken()
-		return fmt.Errorf("faild get token from server: %s", resp.Message)
+		return fmt.Errorf("failed to get token from server: %s", resp.ErrorDetails())
 	}
 
 	// Update token
@@ -189,6 +199,7 @@ func (ts *TokenSource) refreshToken() error {
 // saveToken saves token to configuration
 func (ts *TokenSource) saveToken() error {
 	if ts.token == nil {
+		ts.m.Set(config.ConfigToken, "")
 		return nil
 	}
 
@@ -201,10 +212,31 @@ func (ts *TokenSource) saveToken() error {
 	return nil
 }
 
+func (ts *TokenSource) callAPI(ctx context.Context, opts rest.Opts, response any, apiResp *api.Response) error {
+	resetAPIResponse(response)
+	_, err := ts.c.CallJSON(ctx, &opts, nil, response)
+	if err != nil {
+		return err
+	}
+	if apiResp != nil && !apiResp.Success() {
+		return fmt.Errorf("API error: %s", apiResp.ErrorDetails())
+	}
+	return nil
+}
+
+func (ts *TokenSource) callAPIWithForm(ctx context.Context, opts rest.Opts, form url.Values, response any, apiResp *api.Response) error {
+	opts.ContentType = "application/x-www-form-urlencoded"
+	opts.Body = strings.NewReader(encodedForm(form))
+	return ts.callAPI(ctx, opts, response, apiResp)
+}
+
 // Auth initiates the authorization process using QR code
 func (ts *TokenSource) Auth(appID string) error {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
+	if appID == "" {
+		appID = defaultAppID
+	}
 	// Get QR code URL
 	authData, err := ts.getAuthURL(ts.ctx, appID)
 	if err != nil {
@@ -213,12 +245,7 @@ func (ts *TokenSource) Auth(appID string) error {
 
 	// Display QR code for user to scan
 	fs.Logf(nil, "Please use the 115 mobile app to scan the QR code: %s", authData.QRCode)
-	fs.Logf(nil, "The QR Code image file is also saved in the current directory as 'open115_qrcode.png'")
 	qrCode, err := qrcode.New(authData.QRCode, qrcode.Medium)
-	if err != nil {
-		return fmt.Errorf("failed to generate QR code: %w", err)
-	}
-	err = qrCode.WriteFile(256, "open115_qrcode.png")
 	if err != nil {
 		return fmt.Errorf("failed to generate QR code: %w", err)
 	}
@@ -242,15 +269,17 @@ func (ts *TokenSource) getAuthURL(ctx context.Context, appID string) (authData *
 	// Calculate code challenge
 	codeChallenge := calculateCodeChallenge(codeVerifier)
 
+	formData := url.Values{}
+	formData.Set("client_id", appID)
+	formData.Set("code_challenge", codeChallenge)
+	formData.Set("code_challenge_method", "sha256")
 	opts := rest.Opts{
-		Method:      "POST",
-		RootURL:     passportAPI,
-		Path:        "/open/authDeviceCode",
-		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(fmt.Sprintf("client_id=%s&code_challenge=%s&code_challenge_method=sha256", appID, codeChallenge)),
+		Method:  "POST",
+		RootURL: passportAPI,
+		Path:    "/open/authDeviceCode",
 	}
 	var resp api.AuthDeviceCodeResponse
-	_, err = ts.c.CallJSON(ctx, &opts, nil, &resp)
+	err = ts.callAPIWithForm(ctx, opts, formData, &resp, &resp.Response)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get authorization code: %w", err)
 	}
@@ -273,7 +302,7 @@ func (ts *TokenSource) pollQRCodeStatus(ctx context.Context, authData *api.AuthD
 	}
 
 	var resp api.QRCodeStatusResponse
-	_, err := ts.c.CallJSON(ctx, &opts, nil, &resp)
+	err := ts.callAPI(ctx, opts, &resp, &resp.Response)
 	if err != nil {
 		return qrCodeStatusWaiting, err
 	}
@@ -324,21 +353,22 @@ func (ts *TokenSource) waitForQRCodeScan(ctx context.Context, authData *api.Auth
 
 // codeToToken uses authorization code to get token
 func (ts *TokenSource) codeToToken(ctx context.Context, authData *api.AuthDeviceCodeData) (*api.Token, error) {
+	formData := url.Values{}
+	formData.Set("uid", authData.UID)
+	formData.Set("code_verifier", authData.CodeVerifier)
 	opts := rest.Opts{
-		Method:      "POST",
-		RootURL:     passportAPI,
-		Path:        "/open/deviceCodeToToken",
-		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(fmt.Sprintf("uid=%s&code_verifier=%s", authData.UID, authData.CodeVerifier)),
+		Method:  "POST",
+		RootURL: passportAPI,
+		Path:    "/open/deviceCodeToToken",
 	}
 	var resp api.DeviceCodeToTokenResponse
-	_, err := ts.c.CallJSON(ctx, &opts, nil, &resp)
+	err := ts.callAPIWithForm(ctx, opts, formData, &resp, &resp.Response)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get token: %w", err)
 	}
 	// Check if response is valid
-	if resp.Code != 0 || resp.Data.AccessToken == "" || resp.Data.RefreshToken == "" {
-		return nil, fmt.Errorf("failed to get token from server: %s", resp.Message)
+	if resp.Data.AccessToken == "" || resp.Data.RefreshToken == "" {
+		return nil, fmt.Errorf("failed to get token from server: %s", resp.ErrorDetails())
 	}
 	// Create Token object
 	expiresAt := time.Now().Add(time.Duration(resp.Data.ExpiresIn) * time.Second)
