@@ -701,14 +701,15 @@ func (o *Object) Storable() bool {
 // See Open in the Object interface for documentation.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	fs.FixRangeOption(options, o.size)
+	return o.fs.download(ctx, o.downloadURL, options...)
+}
 
-	// Get download URL
+func (o *Object) downloadURL(ctx context.Context) (string, error) {
 	resp, err := o.fs.getFileDownloadURL(ctx, o.pickCode)
 	if err != nil {
-		return nil, fmt.Errorf("[Open] failed to get download URL: %w", err)
+		return "", fmt.Errorf("[Open] failed to get download URL: %w", err)
 	}
 
-	// Get URL and file ID from response
 	var fileInfo api.FileDownloadInfo
 	for fileID, info := range resp.Data {
 		if fileID == o.id {
@@ -718,9 +719,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 
 	if fileInfo.URL.URL == "" {
-		return nil, fmt.Errorf("[Open] could not find download URL for file id %s in API response", o.id)
+		return "", fmt.Errorf("[Open] could not find download URL for file id %s in API response", o.id)
 	}
-	return o.fs.download(ctx, fileInfo.URL.URL, options...)
+	return fileInfo.URL.URL, nil
 }
 
 // Update the object with the contents of the io.Reader, modTime and size
@@ -1554,18 +1555,33 @@ func shouldRetry(ctx context.Context, res *http.Response, resp *api.Response, er
 	return retry || fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(res, retryHTTPStatusCodes), err
 }
 
-// download starts a download from the given URL and returns the response body reader
-func (f *Fs) download(ctx context.Context, url string, options ...fs.OpenOption) (io.ReadCloser, error) {
+// download starts a download from a generated URL and returns the response body reader.
+func (f *Fs) download(ctx context.Context, urlFn func(context.Context) (string, error), options ...fs.OpenOption) (io.ReadCloser, error) {
 	opts := rest.Opts{
-		Method:  "GET",
-		RootURL: url,
+		Method: "GET",
 	}
 	opts.Options = options
 	var resp *http.Response
+	var downloadURL string
 	err := f.pacer.Call(func() (bool, error) {
 		var err error
+		if downloadURL == "" {
+			downloadURL, err = urlFn(ctx)
+			if err != nil {
+				return false, err
+			}
+			opts.RootURL = downloadURL
+		}
 		resp, err = f.client.Call(ctx, &opts)
-		return shouldRetry(ctx, resp, nil, err)
+		retry, err := shouldRetry(ctx, resp, nil, err)
+		if retry || fserrors.ContextError(ctx, &err) {
+			return retry, err
+		}
+		if resp != nil && resp.StatusCode == http.StatusForbidden {
+			downloadURL = ""
+			return true, err
+		}
+		return false, err
 	})
 	if err != nil {
 		return nil, err
