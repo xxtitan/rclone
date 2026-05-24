@@ -524,7 +524,7 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	}
 
 	// Execute file upload
-	return f.upload(ctx, in, remote, directoryID, size)
+	return f.upload(ctx, in, src, remote, directoryID, size)
 }
 
 // Mkdir creates the container if it doesn't exist
@@ -752,7 +752,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 
 	// Execute file upload with the original remote path
-	newObj, err := o.fs.upload(ctx, in, o.remote, directoryID, size)
+	newObj, err := o.fs.upload(ctx, in, src, o.remote, directoryID, size)
 	if err != nil {
 		return err
 	}
@@ -1225,24 +1225,12 @@ func isActuallySeekable(rs io.ReadSeeker) bool {
 	return err == nil
 }
 
-// getIOReadSeekerFromReader attempts to get an io.ReadSeeker from an io.Reader
-func getIOReadSeekerFromReader(in io.Reader, size int64) (rs io.ReadSeeker, cleanup func(), err error) {
-	// Empty cleanup function
-	cleanup = func() {}
-
-	// Check if already a ReadSeeker and verify it's actually seekable
-	if rs, ok := in.(io.ReadSeeker); ok {
-		if isActuallySeekable(rs) {
-			return rs, cleanup, nil
-		}
-		// ReadSeeker interface exists but Seek doesn't work (e.g., *asyncreader.AsyncReader wrapped in *accounting.Account)
-		// Fall through to temporary file approach
-	}
-
+// copyReaderToTempFile copies an upload stream to a temporary file and returns it as an io.ReadSeeker.
+func copyReaderToTempFile(in io.Reader, size int64) (rs io.ReadSeeker, cleanup func(), err error) {
 	// Create temporary file
 	tempFile, err := os.CreateTemp("", "rclone-open115-upload-*")
 	if err != nil {
-		return nil, cleanup, fmt.Errorf("failed to create temporary file: %w", err)
+		return nil, func() {}, fmt.Errorf("failed to create temporary file: %w", err)
 	}
 
 	// Setup cleanup function
@@ -1272,6 +1260,44 @@ func getIOReadSeekerFromReader(in io.Reader, size int64) (rs io.ReadSeeker, clea
 	}
 
 	return tempFile, cleanup, nil
+}
+
+type preparedUpload struct {
+	reader     io.Reader
+	readSeeker io.ReadSeeker
+	sha1Hash   string
+	cleanup    func()
+	size       int64
+}
+
+func (p *preparedUpload) ensureReadSeeker() (io.ReadSeeker, error) {
+	if p.readSeeker != nil {
+		return p.readSeeker, nil
+	}
+	rs, cleanup, err := copyReaderToTempFile(p.reader, p.size)
+	if err != nil {
+		return nil, err
+	}
+	oldCleanup := p.cleanup
+	p.cleanup = func() {
+		cleanup()
+		oldCleanup()
+	}
+	p.reader = rs
+	p.readSeeker = rs
+	return rs, nil
+}
+
+func (p *preparedUpload) rewindForUpload() error {
+	if p.readSeeker == nil {
+		return nil
+	}
+	_, err := p.readSeeker.Seek(0, io.SeekStart)
+	if err != nil {
+		return fmt.Errorf("failed to seek to start: %w", err)
+	}
+	p.reader = p.readSeeker
+	return nil
 }
 
 // calculateSHA1 calculates the SHA1 hash of data
@@ -1306,8 +1332,108 @@ func calculateSHA1FromReadSeeker(rs io.ReadSeeker) (string, error) {
 	return calculateSHA1(rs)
 }
 
+func calculateSHA1FromObject(ctx context.Context, obj fs.Object) (sha1Hash string, err error) {
+	rc, err := obj.Open(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to open source object: %w", err)
+	}
+	defer fs.CheckClose(rc, &err)
+	return calculateSHA1(rc)
+}
+
+func calculateSHA1RangeFromReadSeeker(rs io.ReadSeeker, start, size int64) (string, error) {
+	currentPos, err := rs.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return "", fmt.Errorf("failed to get current position: %w", err)
+	}
+	defer func() {
+		_, _ = rs.Seek(currentPos, io.SeekStart)
+	}()
+
+	_, err = rs.Seek(start, io.SeekStart)
+	if err != nil {
+		return "", fmt.Errorf("failed to seek to range start: %w", err)
+	}
+	return calculateSHA1Range(rs, size)
+}
+
+func calculateSHA1RangeFromObject(ctx context.Context, obj fs.Object, start, end int64) (sha1Hash string, err error) {
+	rc, err := obj.Open(ctx, &fs.RangeOption{Start: start, End: end})
+	if err != nil {
+		return "", fmt.Errorf("failed to open source range: %w", err)
+	}
+	defer fs.CheckClose(rc, &err)
+	return calculateSHA1Range(rc, end-start+1)
+}
+
+func sourceObject(src fs.ObjectInfo) fs.Object {
+	if obj, ok := src.(fs.Object); ok {
+		return obj
+	}
+	if unwrapper, ok := src.(fs.ObjectUnWrapper); ok {
+		return unwrapper.UnWrap()
+	}
+	return nil
+}
+
+func normalizeSHA1(sha1Hash string) (string, bool) {
+	sha1Hash = strings.ToLower(strings.TrimSpace(sha1Hash))
+	if len(sha1Hash) != 40 {
+		return "", false
+	}
+	_, err := hex.DecodeString(sha1Hash)
+	return sha1Hash, err == nil
+}
+
+func getSourceSHA1(ctx context.Context, src fs.ObjectInfo) (string, bool) {
+	if src == nil {
+		return "", false
+	}
+	sha1Hash, err := src.Hash(ctx, hash.SHA1)
+	if err != nil {
+		fs.Debugf(src, "Failed to get SHA1 from source object, falling back to upload stream: %v", err)
+		return "", false
+	}
+	original := sha1Hash
+	sha1Hash, ok := normalizeSHA1(original)
+	if !ok && original != "" {
+		fs.Debugf(src, "Ignoring invalid SHA1 from source object")
+	}
+	return sha1Hash, ok
+}
+
+func (p *preparedUpload) calculateSignCheckSHA1(ctx context.Context, src fs.ObjectInfo, start, end int64) (string, error) {
+	if obj := sourceObject(src); obj != nil {
+		sha1Hash, err := calculateSHA1RangeFromObject(ctx, obj, start, end)
+		if err == nil {
+			return sha1Hash, nil
+		}
+		fs.Debugf(src, "Failed to calculate sign check SHA1 from source range, falling back to upload stream: %v", err)
+	}
+
+	rs, err := p.ensureReadSeeker()
+	if err != nil {
+		return "", err
+	}
+	return calculateSHA1RangeFromReadSeeker(rs, start, end-start+1)
+}
+
+func newPreparedUpload(in io.Reader, sha1Hash string, size int64) *preparedUpload {
+	var readSeeker io.ReadSeeker
+	if rs, ok := in.(io.ReadSeeker); ok && isActuallySeekable(rs) {
+		readSeeker = rs
+	}
+	return &preparedUpload{
+		reader:     in,
+		readSeeker: readSeeker,
+		sha1Hash:   sha1Hash,
+		cleanup:    func() {},
+		size:       size,
+	}
+}
+
 // initializeUpload initializes the upload process
-func (f *Fs) initializeUpload(ctx context.Context, remote, directoryID string, size int64, fileSHA1 string, reader io.ReadSeeker) (*api.InitUploadData, error) {
+func (f *Fs) initializeUpload(ctx context.Context, remote, directoryID string, size int64, fileSHA1 string, signCheck func(start, end int64) (string, error)) (*api.InitUploadData, error) {
 	// Build upload initialization request
 	// Encode the file name for the API
 	encodedFileName := f.opt.Enc.FromStandardName(path.Base(remote))
@@ -1337,15 +1463,8 @@ func (f *Fs) initializeUpload(ctx context.Context, remote, directoryID string, s
 			return nil, fmt.Errorf("failed to parse sign check range: %w", err)
 		}
 
-		// Reset reader position to the authentication position
-		_, err = reader.Seek(start, io.SeekStart)
-		if err != nil {
-			return nil, fmt.Errorf("failed to seek to sign check start position: %w", err)
-		}
-
 		// Calculate SHA1 for the specified range
-		checkLength := end - start + 1
-		signSHA1, err := calculateSHA1Range(reader, checkLength)
+		signSHA1, err := signCheck(start, end)
 		if err != nil {
 			return nil, fmt.Errorf("failed to calculate sign check SHA1: %w", err)
 		}
@@ -1380,33 +1499,70 @@ func calculateSHA1Range(r io.Reader, size int64) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// prepareFileForUpload prepares a file for upload, calculating SHA1 and returning necessary info
-func prepareFileForUpload(in io.Reader, size int64) (reader io.ReadSeeker, sha1Hash string, cleanup func(), err error) {
-	// Get ReadSeeker
-	reader, cleanup, err = getIOReadSeekerFromReader(in, size)
-	if err != nil {
-		return nil, "", func() {}, err
+// prepareFileForUpload prepares a file for upload, calculating SHA1 and returning necessary info.
+func prepareFileForUpload(ctx context.Context, in io.Reader, src fs.ObjectInfo, size int64) (upload *preparedUpload, err error) {
+	if sha1Hash, ok := getSourceSHA1(ctx, src); ok {
+		return newPreparedUpload(in, sha1Hash, size), nil
 	}
 
-	// Calculate SHA1
-	sha1Hash, err = calculateSHA1FromReadSeeker(reader)
+	if obj := sourceObject(src); obj != nil {
+		sha1Hash, err := calculateSHA1FromObject(ctx, obj)
+		if err == nil {
+			return newPreparedUpload(in, sha1Hash, size), nil
+		}
+		fs.Debugf(src, "Failed to calculate SHA1 from source object, falling back to upload stream: %v", err)
+	}
+
+	if rs, ok := in.(io.ReadSeeker); ok {
+		if isActuallySeekable(rs) {
+			sha1Hash, err := calculateSHA1FromReadSeeker(rs)
+			if err != nil {
+				return nil, fmt.Errorf("failed to calculate SHA1: %w", err)
+			}
+			_, err = rs.Seek(0, io.SeekStart)
+			if err != nil {
+				return nil, fmt.Errorf("failed to seek to start: %w", err)
+			}
+			return &preparedUpload{
+				reader:     rs,
+				readSeeker: rs,
+				sha1Hash:   sha1Hash,
+				cleanup:    func() {},
+				size:       size,
+			}, nil
+		}
+		// ReadSeeker interface exists but Seek doesn't work (e.g. *asyncreader.AsyncReader wrapped in *accounting.Account).
+		// Fall through to temporary file approach.
+	}
+
+	rs, cleanup, err := copyReaderToTempFile(in, size)
+	if err != nil {
+		return nil, err
+	}
+
+	sha1Hash, err := calculateSHA1FromReadSeeker(rs)
 	if err != nil {
 		cleanup()
-		return nil, "", func() {}, fmt.Errorf("failed to calculate SHA1: %w", err)
+		return nil, fmt.Errorf("failed to calculate SHA1: %w", err)
 	}
 
-	// Reset position
-	_, err = reader.Seek(0, io.SeekStart)
+	_, err = rs.Seek(0, io.SeekStart)
 	if err != nil {
 		cleanup()
-		return nil, "", func() {}, fmt.Errorf("failed to seek to start: %w", err)
+		return nil, fmt.Errorf("failed to seek to start: %w", err)
 	}
 
-	return reader, sha1Hash, cleanup, nil
+	return &preparedUpload{
+		reader:     rs,
+		readSeeker: rs,
+		sha1Hash:   sha1Hash,
+		cleanup:    cleanup,
+		size:       size,
+	}, nil
 }
 
 // upload handles the file upload process
-func (f *Fs) upload(ctx context.Context, in io.Reader, remote string,
+func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string,
 	directoryID string, size int64) (fs.Object, error) {
 
 	// Handle empty files
@@ -1415,15 +1571,17 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, remote string,
 	}
 
 	// Prepare file for upload
-	reader, fileSHA1, cleanup, err := prepareFileForUpload(in, size)
+	prepared, err := prepareFileForUpload(ctx, in, src, size)
 	if err != nil {
 		return nil, err
 	}
 	// Ensure cleanup runs when function exits
-	defer cleanup()
+	defer prepared.cleanup()
 
 	// Initialize upload
-	initData, err := f.initializeUpload(ctx, remote, directoryID, size, fileSHA1, reader)
+	initData, err := f.initializeUpload(ctx, remote, directoryID, size, prepared.sha1Hash, func(start, end int64) (string, error) {
+		return prepared.calculateSignCheckSHA1(ctx, src, start, end)
+	})
 	if err != nil {
 		fs.Errorf(nil, "failed to initialize upload: %+v", err)
 		return nil, err
@@ -1439,7 +1597,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, remote string,
 			PC:   initData.PickCode,
 			FS:   json.Number(fmt.Sprintf("%d", size)),
 			UPT:  uint64(time.Now().Unix()),
-			SHA1: fileSHA1,
+			SHA1: prepared.sha1Hash,
 		})
 	}
 
@@ -1449,10 +1607,9 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, remote string,
 		return nil, fmt.Errorf("failed to get upload token: %w", err)
 	}
 
-	// Reset file position for upload
-	_, err = reader.Seek(0, io.SeekStart)
-	if err != nil {
-		return nil, fmt.Errorf("failed to seek to start: %w", err)
+	// Reset file position for upload when the prepared reader is seekable.
+	if err = prepared.rewindForUpload(); err != nil {
+		return nil, err
 	}
 
 	// Calculate chunk size
@@ -1461,10 +1618,10 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, remote string,
 	// Choose upload method based on file size
 	if chunkSize >= size {
 		// Use single upload for small files
-		err = uploadToOSS(ctx, reader, *initData, tokenResp.Data, size)
+		err = uploadToOSS(ctx, prepared.reader, *initData, tokenResp.Data, size)
 	} else {
 		// Use multipart upload for large files
-		err = uploadMultipartToOSS(ctx, reader, *initData, tokenResp.Data, size, chunkSize)
+		err = uploadMultipartToOSS(ctx, prepared.reader, *initData, tokenResp.Data, size, chunkSize)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to upload file to OSS: %w", err)
@@ -1477,7 +1634,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, remote string,
 		PC:   initData.PickCode,
 		FS:   json.Number(fmt.Sprintf("%d", size)),
 		UPT:  uint64(time.Now().Unix()),
-		SHA1: fileSHA1,
+		SHA1: prepared.sha1Hash,
 	})
 }
 
