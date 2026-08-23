@@ -45,3 +45,53 @@ func TestResponseStateBoolAndString(t *testing.T) {
 		}
 	}
 }
+
+func TestResponseStateRejectsOtherNumbers(t *testing.T) {
+	for _, input := range []string{`{"state":2}`, `{"state":-1}`, `{"state":"2"}`} {
+		var resp Response
+		if err := json.Unmarshal([]byte(input), &resp); err == nil {
+			t.Fatalf("expected %s to fail", input)
+		}
+	}
+}
+
+func TestCallbackValue(t *testing.T) {
+	for _, input := range []string{`{"callback":[]}`, `{"callback":null}`} {
+		var data InitUploadData
+		if err := json.Unmarshal([]byte(input), &data); err != nil {
+			t.Fatal(err)
+		}
+		callback, err := data.GetCallback()
+		if err != nil || callback != (Callback{}) {
+			t.Fatalf("unexpected empty callback result: %#v, %v", callback, err)
+		}
+	}
+
+	var data InitUploadData
+	err := json.Unmarshal([]byte(`{"callback":{"callback":"body","callback_var":"vars"}}`), &data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callback, err := data.GetCallback()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if callback.Callback != "body" || callback.CallbackVar != "vars" {
+		t.Fatalf("unexpected callback: %#v", callback)
+	}
+
+	for _, input := range []string{
+		`{"callback":[{}]}`,
+		`{"callback":"bad"}`,
+		`{"callback":{"callback":"body"}}`,
+	} {
+		var invalid InitUploadData
+		err := json.Unmarshal([]byte(input), &invalid)
+		if err == nil {
+			_, err = invalid.GetCallback()
+		}
+		if err == nil {
+			t.Fatalf("expected %s to fail", input)
+		}
+	}
+}

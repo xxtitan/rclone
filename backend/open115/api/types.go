@@ -2,10 +2,9 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"reflect"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -37,12 +36,6 @@ func (s *ResponseState) UnmarshalJSON(data []byte) error {
 		}
 	}
 
-	number, err := strconv.ParseInt(value, 10, 64)
-	if err == nil {
-		*s = number != 0
-		return nil
-	}
-
 	return fmt.Errorf("invalid response state %q", value)
 }
 
@@ -59,6 +52,11 @@ type Response struct {
 	Error   string         `json:"error,omitempty"`   // Error is the error message.
 	Errno   int            `json:"errno,omitempty"`   // Errno is the error number.
 	Request string         `json:"request,omitempty"` // Request is the API request path.
+}
+
+// GetResponse returns the embedded API response.
+func (r *Response) GetResponse() *Response {
+	return r
 }
 
 // Success reports whether the API response represents a successful request.
@@ -160,8 +158,8 @@ type FileLabel struct {
 	Sort       string `json:"sort"`        // Sort is the file label sort order.
 	Color      string `json:"color"`       // Color is the file label color.
 	IsDefault  int    `json:"is_default"`  // IsDefault indicates the type: 0: Recently used; 1: Not recently used; 2: Default label.
-	UpdateTime int    `json:"update_time"` // UpdateTime is the update time.
-	CreateTime int    `json:"create_time"` // CreateTime is the creation time.
+	UpdateTime int64  `json:"update_time"` // UpdateTime is the update time.
+	CreateTime int64  `json:"create_time"` // CreateTime is the creation time.
 }
 
 // FileInfo represents information about a file or folder.
@@ -175,9 +173,9 @@ type FileInfo struct {
 	ISM      json.Number `json:"ism"`                 // ISM indicates if starred (1: starred).
 	ISP      json.Number `json:"isp"`                 // ISP indicates if encrypted (1: encrypted).
 	PC       string      `json:"pc"`                  // PC is the file pick code.
-	UPT      uint64      `json:"upt"`                 // UPT is the modification time.
-	UET      uint64      `json:"uet"`                 // UET is the modification time (duplicate?).
-	UPPT     uint64      `json:"uppt"`                // UPPT is the upload time.
+	UPT      int64       `json:"upt"`                 // UPT is the modification time.
+	UET      int64       `json:"uet"`                 // UET is the modification time (duplicate?).
+	UPPT     int64       `json:"uppt"`                // UPPT is the upload time.
 	CM       int         `json:"cm"`                  // CM - unknown purpose.
 	FDesc    string      `json:"fdesc"`               // FDesc is the file description/remark.
 	ISPL     json.Number `json:"ispl"`                // ISPL - toggle for counting video duration in a folder?
@@ -199,10 +197,10 @@ type FileInfo struct {
 // PathInfo represents information about a file path component.
 type PathInfo struct {
 	Name string      `json:"name"`  // Name is the parent directory name.
-	AID  interface{} `json:"aid"`   // AID - unknown purpose.
-	CID  interface{} `json:"cid"`   // CID - unknown purpose.
-	PID  interface{} `json:"pid"`   // PID - unknown purpose.
-	ISP  interface{} `json:"isp"`   // ISP - unknown purpose.
+	AID  json.Number `json:"aid"`   // AID is the area ID.
+	CID  json.Number `json:"cid"`   // CID is the directory ID.
+	PID  json.Number `json:"pid"`   // PID is the parent directory ID.
+	ISP  json.Number `json:"isp"`   // ISP indicates whether the directory is protected.
 	PCID string      `json:"p_cid"` // PCID - unknown purpose.
 	FV   string      `json:"fv"`    // FV - unknown purpose.
 }
@@ -211,15 +209,15 @@ type PathInfo struct {
 type FileListResponse struct {
 	Response
 	Data       []FileInfo  `json:"data"`             // Data contains the list of files/folders.
-	Count      int         `json:"count"`            // Count - unknown purpose.
-	SysCount   int         `json:"sys_count"`        // SysCount is the number of system folders.
-	Offset     int         `json:"offset"`           // Offset is the starting position.
+	Count      int64       `json:"count"`            // Count is the number of entries.
+	SysCount   int64       `json:"sys_count"`        // SysCount is the number of system folders.
+	Offset     int64       `json:"offset"`           // Offset is the starting position.
 	Limit      json.Number `json:"limit"`            // Limit is the page size.
 	AID        int         `json:"aid"`              // AID is the file status filter.
-	CID        int         `json:"cid"`              // CID is the parent directory ID.
+	CID        int64       `json:"cid"`              // CID is the parent directory ID.
 	IsAsc      int         `json:"is_asc"`           // IsAsc is the sort order (1: ascending, 0: descending).
-	MinSize    int         `json:"min_size"`         // MinSize - unknown purpose.
-	MaxSize    int         `json:"max_size"`         // MaxSize - unknown purpose.
+	MinSize    int64       `json:"min_size"`         // MinSize is the lower size filter.
+	MaxSize    int64       `json:"max_size"`         // MaxSize is the upper size filter.
 	SysDir     string      `json:"sys_dir"`          // SysDir - unknown purpose.
 	HideData   string      `json:"hide_data"`        // HideData indicates whether file data is returned.
 	RecordTime string      `json:"record_open_time"` // RecordTime indicates whether to record folder open time.
@@ -245,37 +243,6 @@ type FolderCreateData struct {
 	FileID   json.Number `json:"file_id"`   // FileID is the ID of the created folder.
 }
 
-// FileInfoResponse represents the response for getting file/folder details.
-type FileInfoResponse struct {
-	Response
-	Data FileDetailInfo `json:"data"` // Data contains the detailed file information.
-}
-
-// FileDetailInfo holds detailed information about a file or folder.
-type FileDetailInfo struct {
-	Count        json.Number `json:"count"`          // Count is the total number of files inside.
-	Size         string      `json:"size"`           // Size is the total size of the file/folder.
-	FolderCount  json.Number `json:"folder_count"`   // FolderCount is the total number of folders inside.
-	PlayLong     json.Number `json:"play_long"`      // PlayLong is the video duration in seconds (-1: calculating, otherwise the duration).
-	ShowPlayLong json.Number `json:"show_play_long"` // ShowPlayLong indicates if video duration display is enabled.
-	PTime        json.Number `json:"ptime"`          // PTime is the upload time.
-	UTime        json.Number `json:"utime"`          // UTime is the modification time.
-	FileName     string      `json:"file_name"`      // FileName is the file/folder name.
-	PickCode     string      `json:"pick_code"`      // PickCode is the file pick code.
-	SHA1         string      `json:"sha1"`           // SHA1 is the SHA1 hash.
-	FileID       string      `json:"file_id"`        // FileID is the file/folder ID.
-	IsMark       string      `json:"is_mark"`        // IsMark indicates if starred.
-	OpenTime     int         `json:"open_time"`      // OpenTime is the last opened time.
-	FileCategory string      `json:"file_category"`  // FileCategory indicates the type (1: File, 0: Folder).
-	Paths        []PathItem  `json:"paths"`          // Paths is the path of the file/folder.
-}
-
-// PathItem represents an item in the file path.
-type PathItem struct {
-	FileID   json.Number `json:"file_id"`   // FileID is the parent directory ID.
-	FileName string      `json:"file_name"` // FileName is the parent directory name.
-}
-
 // FileDownloadResponse represents the response for getting a file download URL.
 type FileDownloadResponse struct {
 	Response
@@ -285,7 +252,7 @@ type FileDownloadResponse struct {
 // FileDownloadInfo holds information needed to download a file.
 type FileDownloadInfo struct {
 	FileName string      `json:"file_name"` // FileName is the file name.
-	FileSize int         `json:"file_size"` // FileSize is the file size.
+	FileSize int64       `json:"file_size"` // FileSize is the file size.
 	PickCode string      `json:"pick_code"` // PickCode is the file pick code.
 	SHA1     string      `json:"sha1"`      // SHA1 is the file SHA1 hash.
 	URL      DownloadURL `json:"url"`       // URL contains the actual download URL.
@@ -308,22 +275,6 @@ type FileUpdateData struct {
 	Star     string `json:"star"`      // Star is the new star status.
 }
 
-// GetFileListRequest represents the parameters for a get file list request.
-type GetFileListRequest struct {
-	CID         string `json:"cid,omitempty"`          // CID is the directory ID (parent_id).
-	Type        int    `json:"type,omitempty"`         // Type is the file type filter (1:Doc, 2:Img, 3:Music, 4:Video, 5:Zip, 6:App, 7:Book).
-	Limit       int    `json:"limit,omitempty"`        // Limit is the number of items to query (default 20, max 1150).
-	Offset      int    `json:"offset,omitempty"`       // Offset is the starting position (default 0).
-	Suffix      string `json:"suffix,omitempty"`       // Suffix is the file extension filter.
-	Asc         int    `json:"asc,omitempty"`          // Asc is the sort order (1: ascending, 0: descending).
-	Order       string `json:"o,omitempty"`            // Order is the sort field (file_name, file_size, user_utime, file_type).
-	CustomOrder int    `json:"custom_order,omitempty"` // CustomOrder: 1 Use custom sort, ignore memory; 0 Use memory sort, custom invalid; 2 Custom sort, non-folders top.
-	StDir       int    `json:"stdir,omitempty"`        // StDir: Show folders when filtering files? (1: show, 0: hide).
-	Star        int    `json:"star,omitempty"`         // Star: Filter starred files (1: yes, 0: all).
-	Cur         int    `json:"cur,omitempty"`          // Cur: Show only files in the current folder?
-	ShowDir     int    `json:"show_dir,omitempty"`     // ShowDir: Show directories? (0 or 1, default 0).
-}
-
 // FileOperationResponse represents a basic response for file operations.
 type FileOperationResponse struct {
 	Response
@@ -341,7 +292,7 @@ type UploadTokenData struct {
 	Endpoint        string `json:"endpoint"`        // Endpoint is the OSS endpoint.
 	AccessKeySecret string `json:"AccessKeySecret"` // AccessKeySecret is the access key secret.
 	SecurityToken   string `json:"SecurityToken"`   // SecurityToken is the security token.
-	Expiration      string `json:"Expiration"`      // Expiration is the expiration time.
+	Expiration      string `json:"expiration"`      // Expiration is the expiration time.
 	AccessKeyID     string `json:"AccessKeyId"`     // AccessKeyID is the access key ID.
 }
 
@@ -366,31 +317,26 @@ type InitUploadResponse struct {
 
 // InitUploadData holds the data returned after initializing an upload.
 type InitUploadData struct {
-	PickCode  string      `json:"pick_code"`  // PickCode is the unique ID for the upload task (used for resume).
-	Status    int         `json:"status"`     // Status: 1: Not fast upload; 2: Fast upload (upload complete).
-	SignKey   string      `json:"sign_key"`   // SignKey is the SHA1 identifier for this calculation (secondary auth).
-	SignCheck string      `json:"sign_check"` // SignCheck is the local file SHA1 range for this calculation (secondary auth).
-	FileID    string      `json:"file_id"`    // FileID is the ID of the new file if fast upload was successful.
-	Target    string      `json:"target"`     // Target is the upload target convention.
-	Bucket    string      `json:"bucket"`     // Bucket is the upload bucket name.
-	Object    string      `json:"object"`     // Object is the OSS object ID.
-	Callback  interface{} `json:"callback"`   // Callback contains callback information.
+	PickCode  string        `json:"pick_code"`  // PickCode is the unique ID for the upload task.
+	Status    int           `json:"status"`     // Status: 1: upload required; 2: rapid upload completed.
+	SignKey   string        `json:"sign_key"`   // SignKey identifies a secondary authentication request.
+	SignCheck string        `json:"sign_check"` // SignCheck is the inclusive local SHA1 range.
+	FileID    string        `json:"file_id"`    // FileID is set when rapid upload succeeds.
+	Target    string        `json:"target"`     // Target is the upload target convention.
+	Bucket    string        `json:"bucket"`     // Bucket is the upload bucket name.
+	Object    string        `json:"object"`     // Object is the OSS object ID.
+	Callback  CallbackValue `json:"callback"`   // Callback contains the OSS callback configuration.
 }
 
 // GetCallback parses the Callback field into a Callback struct.
 func (d *InitUploadData) GetCallback() (Callback, error) {
-	// If it's a Callback struct
-	if cb, ok := d.Callback.(map[string]interface{}); ok {
-		return Callback{
-			Callback:    cb["callback"].(string),
-			CallbackVar: cb["callback_var"].(string),
-		}, nil
-	}
-	if d.Callback == nil || (reflect.TypeOf(d.Callback).Kind() == reflect.Slice &&
-		reflect.ValueOf(d.Callback).Len() == 0) {
+	if d.Callback.Value == nil {
 		return Callback{}, nil
 	}
-	return Callback{}, fmt.Errorf("unsupported callback type: %v", d.Callback)
+	if d.Callback.Value.Callback == "" || d.Callback.Value.CallbackVar == "" {
+		return Callback{}, fmt.Errorf("invalid upload callback: callback fields are empty")
+	}
+	return *d.Callback.Value, nil
 }
 
 // Callback holds callback information for upload operations.
@@ -399,48 +345,43 @@ type Callback struct {
 	CallbackVar string `json:"callback_var"` // CallbackVar are the callback parameters after upload.
 }
 
-// ResumeUploadRequest represents the request to resume an upload.
-type ResumeUploadRequest struct {
-	FileSize int64  `json:"file_size"` // FileSize is the file size in bytes.
-	Target   string `json:"target"`    // Target is the upload target convention.
-	FileID   string `json:"fileid"`    // FileID is the file SHA1 hash.
-	PickCode string `json:"pick_code"` // PickCode is the upload task key.
+// CallbackValue accepts the callback object or the empty array returned for rapid uploads.
+type CallbackValue struct {
+	Value *Callback // Value is nil when the API returns an empty callback array.
 }
 
-// ResumeUploadResponse represents the response for resuming an upload.
-type ResumeUploadResponse struct {
+// UnmarshalJSON decodes an upload callback object or an empty array.
+func (v *CallbackValue) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if bytes.Equal(data, []byte("null")) || bytes.Equal(data, []byte("[]")) {
+		v.Value = nil
+		return nil
+	}
+	if len(data) == 0 || data[0] != '{' {
+		return fmt.Errorf("invalid upload callback %q", data)
+	}
+	var callback Callback
+	if err := json.Unmarshal(data, &callback); err != nil {
+		return fmt.Errorf("invalid upload callback: %w", err)
+	}
+	v.Value = &callback
+	return nil
+}
+
+// UploadResultResponse is returned by the OSS callback after a successful upload.
+type UploadResultResponse struct {
 	Response
-	Data []ResumeUploadData `json:"data"` // Data contains the resume upload information.
+	Data UploadResult `json:"data"`
 }
 
-// ResumeUploadData holds the data returned when resuming an upload.
-type ResumeUploadData struct {
-	PickCode    string `json:"pick_code"`    // PickCode is the unique ID for the upload task.
-	Target      string `json:"target"`       // Target is the upload target convention.
-	Version     string `json:"version"`      // Version is the API version.
-	Bucket      string `json:"bucket"`       // Bucket is the upload bucket name.
-	Object      string `json:"object"`       // Object is the OSS object ID.
-	Callback    string `json:"callback"`     // Callback is the callback info after upload.
-	CallbackVar string `json:"callback_var"` // CallbackVar are the callback parameters after upload.
-}
-
-// UploadFileRequest aggregates all parameters needed for the upload process.
-type UploadFileRequest struct {
-	FileName  string // FileName is the file name.
-	FileSize  int64  // FileSize is the file size in bytes.
-	Target    string // Target is the upload target convention (e.g., U_1_0).
-	FileID    string // FileID is the file SHA1 hash.
-	PreID     string // PreID is the SHA1 of the first 128K (optional).
-	TopUpload int    // TopUpload is a flag for scheduling based on file type (optional).
-}
-
-// UploadFileResponse aggregates the results of the upload process.
-type UploadFileResponse struct {
-	FileID      string               // FileID is the ID of the new file if fast upload was successful.
-	PickCode    string               // PickCode is the unique ID for the upload task.
-	IsFast      bool                 // IsFast indicates if fast upload was successful.
-	InitRes     *InitUploadResponse  // InitRes contains the initialization response.
-	UploadToken *UploadTokenResponse // UploadToken contains the upload credentials (only present if actual upload is needed).
+// UploadResult identifies the file created by an OSS upload.
+type UploadResult struct {
+	PickCode string      `json:"pick_code"` // PickCode is the file download code.
+	FileSize json.Number `json:"file_size"` // FileSize is the uploaded size.
+	FileID   string      `json:"file_id"`   // FileID identifies the uploaded file.
+	SHA1     string      `json:"sha1"`      // SHA1 is the uploaded content hash.
+	FileName string      `json:"file_name"` // FileName is the uploaded file name.
+	CID      string      `json:"cid"`       // CID identifies the parent directory.
 }
 
 // UserInfoResponse represents the response for getting user information.

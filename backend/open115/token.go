@@ -6,8 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"math/big"
 	"net/url"
 	"strings"
 	"sync"
@@ -20,10 +20,17 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/fserrors"
 )
 
-// ErrQRCodeTimeout is the error returned when QR code scanning times out
-var ErrQRCodeTimeout = fmt.Errorf("QR code scanning timeout, please run configuration again")
+// ErrQRCodeTimeout is returned when QR code scanning times out.
+var ErrQRCodeTimeout = errors.New("QR code scanning timeout, please run configuration again")
+
+// ErrQRCodeExpired is returned when the authorization QR code expires.
+var ErrQRCodeExpired = errors.New("QR code expired, please run configuration again")
+
+// ErrQRCodeCanceled is returned when QR code authorization is canceled.
+var ErrQRCodeCanceled = errors.New("QR code authorization canceled")
 
 const (
 	errorCodeNoAuth              = 40140116
@@ -47,6 +54,8 @@ const (
 	qrCodeStatusWaiting   qrCodeStatus = 0 // Waiting for scan
 	qrCodeStatusScanned   qrCodeStatus = 1 // Scanned, waiting for confirmation
 	qrCodeStatusConfirmed qrCodeStatus = 2 // Confirmed
+	qrCodeStatusExpired   qrCodeStatus = -1
+	qrCodeStatusCanceled  qrCodeStatus = -2
 )
 
 // TokenSource is a custom OAuth2 TokenSource implementation
@@ -93,7 +102,7 @@ func (ts *TokenSource) readToken() error {
 	token := &api.Token{}
 	err := json.Unmarshal([]byte(tokenJSON), token)
 	if err != nil {
-		return fmt.Errorf("unable to parse token: %v", err)
+		return fmt.Errorf("unable to parse token: %w", err)
 	}
 
 	ts.token = token
@@ -104,6 +113,28 @@ func (ts *TokenSource) readToken() error {
 	ts.expiry = ts.token.ExpiresAt
 
 	return nil
+}
+
+// reReadToken reloads a token rotated by another rclone process.
+// The caller must hold ts.mu for writing.
+func (ts *TokenSource) reReadToken() (bool, error) {
+	tokenJSON, found := ts.m.Get(config.ConfigToken)
+	if !found || tokenJSON == "" {
+		return false, nil
+	}
+	var token api.Token
+	if err := json.Unmarshal([]byte(tokenJSON), &token); err != nil {
+		return false, fmt.Errorf("unable to parse token: %w", err)
+	}
+	if token.ExpiresAt.IsZero() {
+		token.ExpiresAt = time.Now().Add(tokenRefreshDuration)
+	}
+	if ts.token != nil && token.AccessToken == ts.token.AccessToken && token.RefreshToken == ts.token.RefreshToken && token.ExpiresAt.Equal(ts.token.ExpiresAt) {
+		return false, nil
+	}
+	ts.token = &token
+	ts.expiry = token.ExpiresAt
+	return true, nil
 }
 
 // Token gets a valid token, refreshing if necessary
@@ -128,10 +159,37 @@ func (ts *TokenSource) Token() (string, error) {
 	if ts.token != nil && !ts.isTokenExpired() {
 		return ts.token.AccessToken, nil
 	}
+	if _, err := ts.reReadToken(); err != nil {
+		return "", err
+	}
+	if ts.token != nil && !ts.isTokenExpired() {
+		return ts.token.AccessToken, nil
+	}
 
 	// Refresh token
 	err := ts.refreshToken()
 	if err != nil {
+		return "", err
+	}
+	return ts.token.AccessToken, nil
+}
+
+// Refresh refreshes a token rejected by the API, using a token rotated by another process when available.
+func (ts *TokenSource) Refresh() (string, error) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	oldAccessToken := ""
+	if ts.token != nil {
+		oldAccessToken = ts.token.AccessToken
+	}
+	changed, err := ts.reReadToken()
+	if err != nil {
+		return "", err
+	}
+	if changed && ts.token.AccessToken != oldAccessToken && !ts.isTokenExpired() {
+		return ts.token.AccessToken, nil
+	}
+	if err = ts.refreshToken(); err != nil {
 		return "", err
 	}
 	return ts.token.AccessToken, nil
@@ -157,18 +215,18 @@ func (ts *TokenSource) refreshToken() error {
 		RootURL:     passportAPI,
 		Path:        "/open/refreshToken",
 		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(encodedForm(formData)),
+		Body:        strings.NewReader(formData.Encode()),
 	}
 	var resp api.TokenResponse
 	resetAPIResponse(&resp)
 	_, err := ts.c.CallJSON(ts.ctx, &opts, nil, &resp)
 	if err != nil {
-		return fmt.Errorf("failed to refresh token: %v", err)
+		return fmt.Errorf("failed to refresh token: %w", err)
 	}
 	// Check if token expired
 	if resp.Code == errorCodeRefreshTokenExpired || resp.Code == errorCodeRefreshTokenInvalid || resp.Code == errorCodeNoAuth {
-		_ = ts.clearToken(true)
-		return fmt.Errorf("refresh token expired or invalid: %s; please run 'rclone config reconnect %s:'", resp.ErrorDetails(), ts.name)
+		clearErr := ts.clearToken(true)
+		return errors.Join(fmt.Errorf("refresh token expired or invalid: %s; please run 'rclone config reconnect %s:'", resp.ErrorDetails(), ts.name), clearErr)
 	}
 
 	// Check if response is valid
@@ -176,8 +234,8 @@ func (ts *TokenSource) refreshToken() error {
 		return fmt.Errorf("failed to get token from server: %s", resp.ErrorDetails())
 	}
 	if resp.Data.AccessToken == "" || resp.Data.RefreshToken == "" {
-		_ = ts.clearToken(false)
-		return fmt.Errorf("failed to get token from server: missing token data")
+		clearErr := ts.clearToken(false)
+		return errors.Join(errors.New("failed to get token from server: missing token data"), clearErr)
 	}
 
 	// Update token
@@ -188,7 +246,7 @@ func (ts *TokenSource) refreshToken() error {
 	// Save new token to configuration
 	err = ts.saveToken()
 	if err != nil {
-		return fmt.Errorf("failed to save token: %v", err)
+		return fmt.Errorf("failed to save token: %w", err)
 	}
 	return nil
 }
@@ -232,7 +290,7 @@ func (ts *TokenSource) callAPI(ctx context.Context, opts rest.Opts, response any
 
 func (ts *TokenSource) callAPIWithForm(ctx context.Context, opts rest.Opts, form url.Values, response any, apiResp *api.Response) error {
 	opts.ContentType = "application/x-www-form-urlencoded"
-	opts.Body = strings.NewReader(encodedForm(form))
+	opts.Body = strings.NewReader(form.Encode())
 	return ts.callAPI(ctx, opts, response, apiResp)
 }
 
@@ -270,7 +328,10 @@ func (ts *TokenSource) Auth(appID string) error {
 // getAuthURL generates QR code URL for user scanning
 func (ts *TokenSource) getAuthURL(ctx context.Context, appID string) (authData *api.AuthDeviceCodeData, err error) {
 	// Generate random code verifier
-	codeVerifier := generateCodeVerifier()
+	codeVerifier, err := generateCodeVerifier()
+	if err != nil {
+		return nil, err
+	}
 
 	// Calculate code challenge
 	codeChallenge := calculateCodeChallenge(codeVerifier)
@@ -331,17 +392,25 @@ func (ts *TokenSource) waitForQRCodeScan(ctx context.Context, authData *api.Auth
 		// Poll QR code status
 		status, err := ts.pollQRCodeStatus(ctx, authData)
 		if err != nil {
-			fs.Logf(nil, "Failed to poll status: %v", err)
-		} else {
-			switch status {
-			case qrCodeStatusConfirmed:
-				// Confirmed, get token
-				return ts.codeToToken(ctx, authData)
-			case qrCodeStatusScanned:
-				fs.Logf(nil, "QR code scanned, waiting for authorization confirmation...")
-			case qrCodeStatusWaiting:
-				fs.Logf(nil, "Waiting for QR code scan...")
+			if !fserrors.ShouldRetry(err) {
+				return nil, err
 			}
+			fs.Debugf(nil, "Temporary QR code status error: %v", err)
+			status = qrCodeStatusWaiting
+		}
+		switch status {
+		case qrCodeStatusConfirmed:
+			return ts.codeToToken(ctx, authData)
+		case qrCodeStatusScanned:
+			fs.Logf(nil, "QR code scanned, waiting for authorization confirmation...")
+		case qrCodeStatusWaiting:
+			fs.Logf(nil, "Waiting for QR code scan...")
+		case qrCodeStatusExpired:
+			return nil, ErrQRCodeExpired
+		case qrCodeStatusCanceled:
+			return nil, ErrQRCodeCanceled
+		default:
+			return nil, fmt.Errorf("unknown QR code status %d", status)
 		}
 
 		// Wait for a while before polling again
@@ -392,21 +461,11 @@ func calculateCodeChallenge(codeVerifier string) string {
 	return base64.RawURLEncoding.EncodeToString(hash[:])
 }
 
-// generateCodeVerifier generates a code verifier
-func generateCodeVerifier() string {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	result := make([]byte, 64)
-	length := len(charset)
-	// Use cryptographically secure random numbers
-	for i := range result {
-		num, err := rand.Int(rand.Reader, big.NewInt(int64(length)))
-		if err != nil {
-			// If crypto random fails, fall back to less random method
-			result[i] = charset[i%length]
-			continue
-		}
-		result[i] = charset[num.Int64()]
+// generateCodeVerifier generates a PKCE code verifier.
+func generateCodeVerifier() (string, error) {
+	data := make([]byte, 48)
+	if _, err := rand.Read(data); err != nil {
+		return "", fmt.Errorf("failed to generate PKCE verifier: %w", err)
 	}
-
-	return string(result)
+	return base64.RawURLEncoding.EncodeToString(data), nil
 }

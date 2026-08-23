@@ -89,6 +89,7 @@ directories to and from different cloud storage providers.
 - Minio [:page_facing_up:](https://rclone.org/s3/#minio)
 - Nextcloud [:page_facing_up:](https://rclone.org/webdav/#nextcloud)
 - Blomp Cloud Storage [:page_facing_up:](https://rclone.org/swift/)
+- Open115 [:page_facing_up:](https://rclone.org/open115/)
 - OpenDrive [:page_facing_up:](https://rclone.org/opendrive/)
 - OpenStack Swift [:page_facing_up:](https://rclone.org/swift/)
 - Oracle Cloud Storage [:page_facing_up:](https://rclone.org/swift/)
