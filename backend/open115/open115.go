@@ -39,7 +39,6 @@ import (
 )
 
 const (
-	defaultAppID       = "100196955"            // default app id for rclone
 	minSleep           = 100 * time.Millisecond // minSleep is the minimum sleep time between retries.
 	maxSleep           = 5 * time.Second        // maxSleep is the maximum sleep time between retries.
 	decayConstant      = 2                      // decayConstant is the backoff factor.
@@ -100,7 +99,7 @@ func Register(fName string) {
 		Options: []fs.Option{
 			{
 				Name:     "app_id",
-				Help:     "open115 appid (leave blank to use default)",
+				Help:     "Open115 application ID. Create one at https://open.115.com/",
 				Required: false,
 			},
 			{
@@ -1029,6 +1028,9 @@ func (f *Fs) Config(ctx context.Context, name string, m configmap.Mapper, config
 		})
 	case "choose_auth_type_done":
 		if config.Result == "auth" {
+			if opt.AppID == "" {
+				return fs.ConfigInput("authorize", "app_id", "Enter your Open115 application ID. Create one at https://open.115.com/")
+			}
 			return fs.ConfigGoto("authorize")
 		} else if config.Result == "token" {
 			return fs.ConfigPassword("authorize_token", "refresh_token", "Enter your refresh token")
@@ -1051,12 +1053,11 @@ func (f *Fs) Config(ctx context.Context, name string, m configmap.Mapper, config
 		}
 		return &fs.ConfigOut{State: ""}, nil
 	case "authorize":
-		appID := func() string {
-			if opt.AppID != "" {
-				return opt.AppID
-			}
-			return defaultAppID
-		}()
+		appID := opt.AppID
+		if config.Result != "" {
+			appID = config.Result
+			m.Set("app_id", appID)
+		}
 		// Use TokenSource to save token
 		fc := fshttp.NewClient(ctx)
 		ts := &TokenSource{

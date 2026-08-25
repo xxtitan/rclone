@@ -19,6 +19,11 @@ func TestGenerateCodeVerifier(t *testing.T) {
 	assert.NotContains(t, verifier, "=")
 }
 
+func TestAuthRequiresAppID(t *testing.T) {
+	err := (&TokenSource{}).Auth("")
+	assert.EqualError(t, err, "Open115 application ID is required; create one at https://open.115.com/")
+}
+
 func TestTokenSourceReReadToken(t *testing.T) {
 	now := time.Now()
 	stored := api.Token{AccessToken: "new access", RefreshToken: "new refresh", ExpiresAt: now.Add(time.Hour)}

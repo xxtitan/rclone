@@ -299,7 +299,7 @@ func (ts *TokenSource) Auth(appID string) error {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	if appID == "" {
-		appID = defaultAppID
+		return errors.New("Open115 application ID is required; create one at https://open.115.com/")
 	}
 	// Get QR code URL
 	authData, err := ts.getAuthURL(ts.ctx, appID)

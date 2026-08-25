@@ -16,6 +16,7 @@ import (
 
 	"github.com/rclone/rclone/backend/open115/api"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fstest"
@@ -24,6 +25,20 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestConfigRequiresAppIDForQRCodeAuthorization(t *testing.T) {
+	m := configmap.Simple{}
+	out, err := fs.MustFind("open115").Config(context.Background(), "test", m, fs.ConfigIn{
+		State:  "choose_auth_type_done",
+		Result: "auth",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, out.Option)
+	assert.Equal(t, "authorize", out.State)
+	assert.Equal(t, "app_id", out.Option.Name)
+	assert.True(t, out.Option.Required)
+	assert.Contains(t, out.Option.Help, "https://open.115.com/")
+}
 
 type failReader struct {
 	read bool

@@ -13,7 +13,8 @@ Paths use the usual `remote:path` syntax and may contain nested directories.
 
 Run `rclone config`, create a remote, and select `open115`. Rclone can authorize by
 displaying a QR code for the 115 mobile application or by validating an existing
-refresh token. The built-in application ID is used when `app_id` is left blank.
+refresh token. QR code authorization requires an application ID created at
+[Open115](https://open.115.com/).
 
 ```text
 No remotes found, make a new one?
