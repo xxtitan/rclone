@@ -100,11 +100,13 @@ func Register(fName string) {
 			{
 				Name:     "app_id",
 				Help:     "Open115 application ID. Create one at https://open.115.com/",
+				Hide:     fs.OptionHideConfigurator,
 				Required: false,
 			},
 			{
 				Name:      "refresh_token",
 				Help:      "Refresh Token (use token instead of appid to authorize)",
+				Hide:      fs.OptionHideConfigurator,
 				Required:  false,
 				Advanced:  true,
 				Sensitive: true,
@@ -112,6 +114,7 @@ func Register(fName string) {
 			{
 				Name:      config.ConfigToken,
 				Help:      "OAuth Access Token as a JSON blob.",
+				Hide:      fs.OptionHideConfigurator,
 				Advanced:  true,
 				Sensitive: true,
 			},
@@ -1019,7 +1022,6 @@ func (f *Fs) Config(ctx context.Context, name string, m configmap.Mapper, config
 			// User doesn't want to re-authorize, so return empty state
 			return nil, nil
 		}
-		// User wants to re-authorize, so proceed to choose auth type
 		return fs.ConfigGoto("choose_auth_type")
 	case "choose_auth_type":
 		return fs.ConfigChooseExclusiveFixed("choose_auth_type_done", "auth_type", "Select authorization type", []fs.OptionExample{

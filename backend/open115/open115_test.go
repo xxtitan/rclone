@@ -16,6 +16,7 @@ import (
 
 	"github.com/rclone/rclone/backend/open115/api"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
@@ -28,7 +29,11 @@ import (
 
 func TestConfigRequiresAppIDForQRCodeAuthorization(t *testing.T) {
 	m := configmap.Simple{}
-	out, err := fs.MustFind("open115").Config(context.Background(), "test", m, fs.ConfigIn{
+	regInfo := fs.MustFind("open115")
+	assert.Equal(t, fs.OptionHideConfigurator, regInfo.Options.Get("app_id").Hide)
+	assert.Equal(t, fs.OptionHideConfigurator, regInfo.Options.Get("refresh_token").Hide)
+	assert.Equal(t, fs.OptionHideConfigurator, regInfo.Options.Get(config.ConfigToken).Hide)
+	out, err := regInfo.Config(context.Background(), "test", m, fs.ConfigIn{
 		State:  "choose_auth_type_done",
 		Result: "auth",
 	})
@@ -38,6 +43,43 @@ func TestConfigRequiresAppIDForQRCodeAuthorization(t *testing.T) {
 	assert.Equal(t, "app_id", out.Option.Name)
 	assert.True(t, out.Option.Required)
 	assert.Contains(t, out.Option.Help, "https://open.115.com/")
+}
+
+func TestConfigRequiresRefreshTokenForTokenAuthorization(t *testing.T) {
+	out, err := fs.MustFind("open115").Config(context.Background(), "test", configmap.Simple{}, fs.ConfigIn{
+		State:  "choose_auth_type_done",
+		Result: "token",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, out.Option)
+	assert.Equal(t, "authorize_token", out.State)
+	assert.Equal(t, "refresh_token", out.Option.Name)
+	assert.True(t, out.Option.IsPassword)
+}
+
+func TestConfigRunsAuthorizationAfterAdvanced(t *testing.T) {
+	regInfo := fs.MustFind("open115")
+	m := configmap.Simple{}
+	out, err := fs.BackendConfig(context.Background(), "test", m, regInfo, configmap.Simple{}, fs.ConfigIn{State: fs.ConfigAll})
+	require.NoError(t, err)
+	require.NotNil(t, out.Option)
+	assert.Equal(t, "config_fs_advanced", out.Option.Name)
+	advancedState := out.State
+
+	advanced, err := fs.BackendConfig(context.Background(), "test", m, regInfo, configmap.Simple{}, fs.ConfigIn{State: advancedState, Result: "true"})
+	require.NoError(t, err)
+	require.NotNil(t, advanced.Option)
+	assert.Equal(t, config.ConfigEncoding, advanced.Option.Name)
+
+	out, err = fs.BackendConfig(context.Background(), "test", m, regInfo, configmap.Simple{}, fs.ConfigIn{State: advancedState, Result: "false"})
+	require.NoError(t, err)
+	require.NotNil(t, out.Option)
+	assert.Equal(t, "auth_type", out.Option.Name)
+
+	out, err = fs.BackendConfig(context.Background(), "test", m, regInfo, configmap.Simple{}, fs.ConfigIn{State: out.State, Result: "auth"})
+	require.NoError(t, err)
+	require.NotNil(t, out.Option)
+	assert.Equal(t, "app_id", out.Option.Name)
 }
 
 type failReader struct {

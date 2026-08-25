@@ -27,10 +27,18 @@ name> remote
 Option Storage.
 Storage> open115
 
+Edit advanced config?
+y) Yes
+n) No (default)
+y/n> n
+
 Select authorization type
 1 / Authenticate using an existing refresh token
 2 / Authenticate with 115 Open Platform QRCode
 auth_type> 2
+
+Enter your Open115 application ID. Create one at https://open.115.com/
+app_id> your_app_id
 ```
 
 The access and refresh tokens stored in the configuration grant access to the
