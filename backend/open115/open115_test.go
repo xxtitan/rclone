@@ -54,7 +54,8 @@ func TestConfigRequiresRefreshTokenForTokenAuthorization(t *testing.T) {
 	require.NotNil(t, out.Option)
 	assert.Equal(t, "authorize_token", out.State)
 	assert.Equal(t, "refresh_token", out.Option.Name)
-	assert.True(t, out.Option.IsPassword)
+	assert.True(t, out.Option.Required)
+	assert.False(t, out.Option.IsPassword)
 }
 
 func TestConfigRunsAuthorizationAfterAdvanced(t *testing.T) {

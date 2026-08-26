@@ -1035,7 +1035,7 @@ func (f *Fs) Config(ctx context.Context, name string, m configmap.Mapper, config
 			}
 			return fs.ConfigGoto("authorize")
 		} else if config.Result == "token" {
-			return fs.ConfigPassword("authorize_token", "refresh_token", "Enter your refresh token")
+			return fs.ConfigInput("authorize_token", "refresh_token", "Enter your refresh token")
 		}
 	case "authorize_token":
 		// Use TokenSource to save token
