@@ -5,14 +5,15 @@ description: "Rclone docs for Open115"
 
 # Open115
 
-Open115 provides access to [115 Cloud](https://115.com/) through its open platform API.
+Open115 provides access to [115 Cloud](https://115.com/) through its open
+platform API.
 
 Paths use the usual `remote:path` syntax and may contain nested directories.
 
 ## Configuration
 
-Run `rclone config`, create a remote, and select `open115`. Rclone can authorize by
-displaying a QR code for the 115 mobile application or by validating an existing
+Run `rclone config`, create a remote, and select `open115`. Rclone can authorize
+by displaying a QR code for the 115 mobile application or by validating an existing
 refresh token. QR code authorization requires an application ID created at
 [Open115](https://open.115.com/).
 
@@ -47,11 +48,20 @@ account. Keep the configuration file private.
 ## Uploads
 
 Open115 verifies uploads with SHA-1 and uses rapid upload when the content already
-exists in 115 Cloud. Larger files use sequential multipart uploads.
+exists in 115 Cloud. Files larger than 20 MiB use multipart uploads. The default
+part size is 20 MiB and increases for very large files.
 
-Streams whose current part cannot be reopened are staged in the system temporary
-directory so a failed part can be retried. At most one upload chunk is staged at a
-time.
+Each file uploads up to four parts concurrently. Use `--transfers` to control
+the number of files uploaded simultaneously.
+
+Seekable inputs supporting independent range reads are uploaded directly. Other
+inputs buffer each active part in rclone's memory pool, using up to 80 MiB per
+file with the default part size. `--use-mmap` controls the pool allocation
+method. Parts larger than 20 MiB and uploads with a positive
+`--max-buffer-memory` limit use the system temporary directory.
+Temporary disk usage for these parts is bounded by four times the part size.
+When the source cannot supply a SHA-1 hash, a stream may also be staged in full
+to calculate it before uploading.
 
 Open115 cannot upload empty files and requires the input size to be known before
 an upload starts. Modification times cannot be set.
@@ -79,4 +89,3 @@ This operation cannot be limited to a directory and cannot be undone.
 - Empty files cannot be uploaded.
 - Uploads require a known size.
 - Modification times cannot be changed.
-- Multipart uploads are sequential.

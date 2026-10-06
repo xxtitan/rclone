@@ -1,12 +1,13 @@
-// Package open115 provides an interface to the 115 Cloud Storage
-package open115
+// Package netdisk115 provides an interface to the 115 Cloud Storage
+package netdisk115
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -24,7 +25,6 @@ import (
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 
-	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/random"
 
 	"github.com/rclone/rclone/fs/fserrors"
@@ -32,11 +32,10 @@ import (
 	"github.com/rclone/rclone/lib/rest"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
-	"github.com/rclone/rclone/backend/open115/api"
+	"github.com/rclone/rclone/backend/115netdisk/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/chunksize"
-	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fshttp"
@@ -60,92 +59,32 @@ const (
 
 // init registers the backend.
 func init() {
-	Register("open115")
+	Register("115netdisk")
 }
 
-// Register registers the backend.
-func Register(fName string) {
-	fs.Register(&fs.RegInfo{
-		Name:        fName,
-		Description: "Open 115 Cloud Drive",
-		NewFs:       NewFs,
-		Config: func(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
-			fc := fshttp.NewClient(ctx)
-			rc := rest.NewClient(fc)
-			opt := new(Options)
-			err := configstruct.Set(m, opt)
-			if err != nil {
-				return nil, err
-			}
-			f := &Fs{
-				name:   name,
-				opt:    *opt,
-				client: newClient(rc, nil),
-			}
-			return f.Config(ctx, name, m, config)
-		},
-		Options: []fs.Option{
-			{
-				Name:     "app_id",
-				Help:     "Open115 application ID. Create one at https://open.115.com/",
-				Hide:     fs.OptionHideConfigurator,
-				Required: false,
-			},
-			{
-				Name:      "refresh_token",
-				Help:      "Refresh Token (use token instead of appid to authorize)",
-				Hide:      fs.OptionHideConfigurator,
-				Required:  false,
-				Advanced:  true,
-				Sensitive: true,
-			},
-			{
-				Name:      config.ConfigToken,
-				Help:      "OAuth Access Token as a JSON blob.",
-				Hide:      fs.OptionHideConfigurator,
-				Advanced:  true,
-				Sensitive: true,
-			},
-			{
-				Name:     config.ConfigEncoding,
-				Help:     config.ConfigEncodingHelp,
-				Advanced: true,
-				// 115 Cloud Drive specific encoding rules
-				// Based on testing and API limitations
-				// 115 does not allow: " \ < >
-				// Also encode leading spaces and control characters as they cause issues
-				Default: encoder.Base |
-					encoder.EncodeBackSlash |
-					encoder.EncodeLeftSpace |
-					encoder.EncodeLeftCrLfHtVt |
-					encoder.EncodeRightSpace |
-					encoder.EncodeRightCrLfHtVt |
-					encoder.EncodeInvalidUtf8 |
-					encoder.EncodeDel |
-					encoder.EncodeDoubleQuote |
-					encoder.EncodeLtGt,
-			},
-		},
-	})
-}
-
-// Options defines the configuration for this backend.
+// Options configures the macOS client protocol and saved session.
 type Options struct {
-	AppID        string               `config:"app_id"`        // AppID is the 115 Open Platform Application ID.
-	RefreshToken string               `config:"refresh_token"` // RefreshToken is an optional refresh token.
-	Enc          encoder.MultiEncoder `config:"encoding"`      // Enc is the encoding for file names.
+	// Cookie stores a Cookie header or dictionary JSON.
+	Cookie string `config:"cookie"`
+	// ClientVersion selects the macOS protocol version.
+	ClientVersion string `config:"client_version"`
+	// UserAgent overrides API and content request identity.
+	UserAgent string `config:"user_agent"`
+	// SecurityKey authorizes account-wide permanent recycle deletion.
+	SecurityKey string `config:"security_key"`
+	// Enc converts between rclone and API leaf names.
+	Enc encoder.MultiEncoder `config:"encoding"`
 }
 
-// Fs represents an 115 drive file system.
+// Fs is a directory-ID-based 115 netdisk filesystem.
 type Fs struct {
-	name        string             // name is the remote name.
-	root        string             // root is the root path.
-	opt         Options            // opt stores the configuration options.
-	features    *fs.Features       // features caches the optional features.
-	pacer       *fs.Pacer          // pacer is the pacer for this Fs.
-	client      *client            // client is the API client.
-	tokenSource *TokenSource       // tokenSource provides API tokens.
-	dirCache    *dircache.DirCache // dirCache caches directory listings.
+	name     string
+	root     string
+	opt      Options
+	features *fs.Features
+	pacer    *fs.Pacer
+	client   *client
+	dirCache *dircache.DirCache
 }
 
 // setRoot sets the root directory path.
@@ -229,20 +168,26 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 	root = strings.Trim(root, "/")
+	ctx, clientConfig := fs.AddConfig(ctx)
+	if opt.ClientVersion == "" {
+		opt.ClientVersion = defaultClientVersion
+	}
+	if opt.UserAgent == "" {
+		opt.UserAgent = "Mozilla/5.0; Mac OS X/13.0; 115Life/" + opt.ClientVersion
+	}
+	clientConfig.UserAgent = opt.UserAgent
 	fc := fshttp.NewClient(ctx)
 	rc := rest.NewClient(fc)
-	tokenSource, err := NewTokenSource(ctx, name, m, rc)
+	c, err := newClient(rc, fc, opt)
 	if err != nil {
 		return nil, err
 	}
-	c := newClient(rc, tokenSource)
 	f := &Fs{
-		name:        name,
-		root:        root,
-		opt:         *opt,
-		pacer:       fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
-		client:      c,
-		tokenSource: tokenSource,
+		name:   name,
+		root:   root,
+		opt:    *opt,
+		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		client: c,
 	}
 	// Set up path handling
 	f.setRoot(root)
@@ -298,27 +243,20 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 // FindLeaf finds a file or directory named leaf in the directory directoryID.
 func (f *Fs) FindLeaf(ctx context.Context, directoryID, leafName string) (string, bool, error) {
-
-	var nextOffset int64
-	for {
-		resp, err := f.getFileList(ctx, directoryID, defaultListPageSize, nextOffset)
-		if err != nil {
-			return "", false, err
-		}
-		for _, item := range resp.Data {
-			// Decode the file name from the API response and compare with the requested name
-			decodedName := f.opt.Enc.ToStandardName(item.FN)
-			if decodedName == leafName {
-				return item.FID, item.FC == fileCategoryFolder, nil // Return ID and whether it's a directory
-			}
-		}
-		// If the returned count is less than the requested count, we have reached the end.
-		if len(resp.Data) < defaultListPageSize {
-			break
-		}
-		nextOffset += defaultListPageSize
+	entries, err := f.listAll(ctx, directoryID)
+	if err != nil {
+		return "", false, err
 	}
-	return "", false, nil
+	var fileID string
+	for _, item := range entries {
+		if f.opt.Enc.ToStandardName(item.FN) == leafName {
+			if item.FC == fileCategoryFolder {
+				return item.FID, true, nil
+			}
+			fileID = item.FID
+		}
+	}
+	return fileID, false, nil
 }
 
 // CreateDir creates the directory named dirName in the directory with directoryID.
@@ -347,51 +285,29 @@ func (f *Fs) CreateDir(ctx context.Context, dirID, dirName string) (string, erro
 //
 // This should return ErrDirNotFound if the directory isn't
 // found.
-func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
+func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
+	cid, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
 		return nil, err
 	}
-
-	var nextOffset int64
-	var fileList []api.FileInfo
-
-	// Get all files page by page
-	for {
-		resp, err := f.getFileList(ctx, directoryID, defaultListPageSize, nextOffset)
-		if err != nil {
-			return nil, err
-		}
-
-		fileList = append(fileList, resp.Data...)
-
-		// If the returned count is less than the requested count, we have reached the end.
-		if len(resp.Data) < defaultListPageSize {
-			break
-		}
-
-		nextOffset += defaultListPageSize
+	items, err := f.listAll(ctx, cid)
+	if err != nil {
+		return nil, err
 	}
-
-	entries = make([]fs.DirEntry, 0, len(fileList))
-	for _, item := range fileList {
-		// Decode the file name from the API response
-		decodedName := f.opt.Enc.ToStandardName(item.FN)
-		remote := path.Join(dir, decodedName)
-		if item.FC == fileCategoryFolder { // Folder
-			// Cache directory ID
+	entries := make(fs.DirEntries, 0, len(items))
+	for _, item := range items {
+		remote := path.Join(dir, f.opt.Enc.ToStandardName(item.FN))
+		if item.FC == fileCategoryFolder {
 			f.dirCache.Put(remote, item.FID)
-			d := fs.NewDir(remote, time.Unix(item.UPT, 0)).SetID(item.FID)
-			entries = append(entries, d)
+			entries = append(entries, fs.NewDir(remote, time.Unix(item.UPT, 0)).SetID(item.FID))
 		} else {
 			o, err := f.newObjectWithInfo(ctx, remote, &item)
 			if err != nil {
-				return nil, fmt.Errorf("failed to parse metadata for %q: %w", remote, err)
+				return nil, err
 			}
 			entries = append(entries, o)
 		}
 	}
-
 	return entries, nil
 }
 
@@ -478,7 +394,7 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	size := src.Size()
 	modTime := src.ModTime(ctx)
 	if size < 0 {
-		return nil, errors.New("open115 requires a known file size")
+		return nil, errors.New("115netdisk requires a known file size")
 	}
 	if size == 0 {
 		return nil, fs.ErrorCantUploadEmptyFiles
@@ -519,7 +435,11 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 
 	// Delete directory
-	_, err = f.deleteFiles(ctx, []string{dirID}, "")
+	_, parentID, err := f.dirCache.FindPath(ctx, dir, false)
+	if err != nil {
+		return err
+	}
+	_, err = f.deleteFiles(ctx, []string{dirID}, parentID)
 	if err != nil {
 		return err
 	}
@@ -598,33 +518,29 @@ func (o *Object) setMetaData(info *api.FileInfo) error {
 
 // readMetaData gets the metadata for the object.
 func (o *Object) readMetaData(ctx context.Context) error {
-	leaf, directoryID, err := o.fs.dirCache.FindPath(ctx, o.remote, false)
+	leaf, cid, err := o.fs.dirCache.FindPath(ctx, o.remote, false)
+	if errors.Is(err, fs.ErrorDirNotFound) {
+		return fs.ErrorObjectNotFound
+	}
 	if err != nil {
-		if errors.Is(err, fs.ErrorDirNotFound) {
-			return fs.ErrorObjectNotFound
-		}
 		return err
 	}
-	var nextOffset int64
-	for {
-		resp, err := o.fs.getFileList(ctx, directoryID, defaultListPageSize, nextOffset)
-		if err != nil {
-			return err
-		}
-		// Search for matching files in the current page
-		for _, item := range resp.Data {
-			// Decode the file name from the API response and compare with the requested name
-			decodedName := o.fs.opt.Enc.ToStandardName(item.FN)
-			if decodedName == leaf {
-				return o.setMetaData(&item)
+	entries, err := o.fs.listAll(ctx, cid)
+	if err != nil {
+		return err
+	}
+	isDir := false
+	for _, item := range entries {
+		if o.fs.opt.Enc.ToStandardName(item.FN) == leaf {
+			if item.FC == fileCategoryFolder {
+				isDir = true
+				continue
 			}
+			return o.setMetaData(&item)
 		}
-		// If the returned count is less than the requested limit, it means we've reached the last page
-		if len(resp.Data) < defaultListPageSize {
-			break
-		}
-		// Update the offset for the next page
-		nextOffset += defaultListPageSize
+	}
+	if isDir {
+		return fs.ErrorIsDir
 	}
 	return fs.ErrorObjectNotFound
 }
@@ -675,27 +591,7 @@ func (o *Object) Storable() bool {
 // See Open in the Object interface for documentation.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	fs.FixRangeOption(options, o.size)
-	return o.fs.download(ctx, o.downloadURL, o.size, options...)
-}
-
-func (o *Object) downloadURL(ctx context.Context) (string, error) {
-	resp, err := o.fs.getFileDownloadURL(ctx, o.pickCode)
-	if err != nil {
-		return "", fmt.Errorf("[Open] failed to get download URL: %w", err)
-	}
-
-	var fileInfo api.FileDownloadInfo
-	for fileID, info := range resp.Data {
-		if fileID == o.id {
-			fileInfo = info
-			break
-		}
-	}
-
-	if fileInfo.URL.URL == "" {
-		return "", fmt.Errorf("[Open] could not find download URL for file id %s in API response", o.id)
-	}
-	return fileInfo.URL.URL, nil
+	return o.fs.download(ctx, o.id, o.pickCode, o.size, options...)
 }
 
 // Update the object with the contents of the io.Reader, modTime and size
@@ -707,7 +603,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	size := src.Size()
 	modTime := src.ModTime(ctx)
 	if size < 0 {
-		return errors.New("open115 requires a known file size")
+		return errors.New("115netdisk requires a known file size")
 	}
 	if size == 0 {
 		return fs.ErrorCantUploadEmptyFiles
@@ -756,7 +652,11 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 // See Remove in the Object interface for documentation.
 func (o *Object) Remove(ctx context.Context) error {
 	// Delete file
-	_, err := o.fs.deleteFiles(ctx, []string{o.id}, "")
+	_, parentID, err := o.fs.dirCache.FindPath(ctx, o.remote, false)
+	if err != nil {
+		return err
+	}
+	_, err = o.fs.deleteFiles(ctx, []string{o.id}, parentID)
 	return err
 }
 
@@ -853,7 +753,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		_, rollbackErr := f.deleteFiles(cleanupCtx, []string{info.FID}, "")
+		_, rollbackErr := f.deleteFiles(cleanupCtx, []string{info.FID}, dstDirID)
 		return nil, errors.Join(err, rollbackErr, restorePrevious(cleanupCtx))
 	}
 	if previous != nil {
@@ -960,112 +860,65 @@ func (f *Fs) DirCacheFlush() {
 	f.dirCache.ResetRoot()
 }
 
-// CleanUp permanently deletes every item in the recycle bin.
+// CleanUp permanently empties the entire account recycle bin.
 func (f *Fs) CleanUp(ctx context.Context) error {
-	form := url.Values{}
-	form.Set("tid", "")
-	opts := rest.Opts{
-		Method:  http.MethodPost,
-		RootURL: baseAPI,
-		Path:    "/open/rb/del",
+	var ids []string
+	var securityEnabled bool
+	for page := 0; page < 100000; page++ {
+		query := url.Values{"limit": {"100"}, "offset": {strconv.Itoa(len(ids))}, "format": {"json"}}
+		body, _, err := f.client.raw(ctx, &rest.Opts{Method: "GET", RootURL: baseAPI, Path: "/rb", Parameters: query})
+		if err != nil {
+			return err
+		}
+		var state api.Response
+		if err = json.Unmarshal(body, &state); err != nil {
+			return err
+		}
+		if !state.Success() {
+			return &apiError{response: state}
+		}
+		var pageData struct {
+			Count    api.Int `json:"count"`
+			Password api.Int `json:"rb_pass"`
+			Data     []struct {
+				ID api.String `json:"id"`
+			} `json:"data"`
+		}
+		if err = json.Unmarshal(body, &pageData); err != nil {
+			return err
+		}
+		securityEnabled = securityEnabled || pageData.Password != 0
+		for _, item := range pageData.Data {
+			if item.ID == "" {
+				return errors.New("recycle entry has no identity")
+			}
+			ids = append(ids, string(item.ID))
+		}
+		if int64(len(ids)) >= int64(pageData.Count) {
+			break
+		}
+		if len(pageData.Data) == 0 {
+			return errors.New("incomplete recycle listing")
+		}
+		if page == 99999 {
+			return errors.New("recycle listing exceeded its page limit")
+		}
 	}
-	var resp api.FileOperationResponse
-	return f.callAPIWithForm(ctx, opts, form, &resp, &resp.Response)
+	if len(ids) == 0 {
+		return nil
+	}
+	password := f.opt.SecurityKey
+	if password == "" {
+		if securityEnabled {
+			return errors.New("configure security_key to empty the account recycle bin")
+		}
+		password = "000000"
+	}
+	var response api.FileOperationResponse
+	return f.callAPIWithForm(ctx, rest.Opts{Method: "POST", RootURL: baseAPI, Path: "/rb/secret_del"},
+		url.Values{"password": {password}, "tid": {strings.Join(ids, ",")}}, &response, &response.Response)
 }
 
-// Config handles the configuration process.
-func (f *Fs) Config(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
-	opt := new(Options)
-	err := configstruct.Set(m, opt)
-	if err != nil {
-		return nil, err
-	}
-
-	switch config.State {
-	case "":
-		// Check token exists
-		if _, err := oauthutil.GetToken(name, m); err != nil {
-			if opt.RefreshToken == "" {
-				return fs.ConfigGoto("choose_auth_type")
-			}
-			fc := fshttp.NewClient(ctx)
-			ts := &TokenSource{
-				c: rest.NewClient(fc),
-				token: &api.Token{
-					RefreshToken: opt.RefreshToken,
-				},
-				ctx:  ctx,
-				m:    m,
-				name: name,
-			}
-			err := ts.refreshToken()
-			if err != nil {
-				return nil, fmt.Errorf("failed to validate/refresh token: %w", err)
-			}
-			return &fs.ConfigOut{State: ""}, nil
-		}
-		return fs.ConfigConfirm("choose_reauthorize", false, "consent_to_authorize", "Re-authorize for new token?")
-	case "choose_reauthorize":
-		if config.Result == "false" {
-			// User doesn't want to re-authorize, so return empty state
-			return nil, nil
-		}
-		return fs.ConfigGoto("choose_auth_type")
-	case "choose_auth_type":
-		return fs.ConfigChooseExclusiveFixed("choose_auth_type_done", "auth_type", "Select authorization type", []fs.OptionExample{
-			{Value: "token", Help: "Authenticate using an existing refresh token"},
-			{Value: "auth", Help: "Authenticate with 115 Open Platform QRCode"},
-		})
-	case "choose_auth_type_done":
-		if config.Result == "auth" {
-			if opt.AppID == "" {
-				return fs.ConfigInput("authorize", "app_id", "Enter your Open115 application ID. Create one at https://open.115.com/")
-			}
-			return fs.ConfigGoto("authorize")
-		} else if config.Result == "token" {
-			return fs.ConfigInput("authorize_token", "refresh_token", "Enter your refresh token")
-		}
-	case "authorize_token":
-		// Use TokenSource to save token
-		fc := fshttp.NewClient(ctx)
-		ts := &TokenSource{
-			c: rest.NewClient(fc),
-			token: &api.Token{
-				RefreshToken: config.Result,
-			},
-			ctx:  ctx,
-			m:    m,
-			name: name,
-		}
-		err := ts.refreshToken() // Immediately refresh to validate and get other token parts
-		if err != nil {
-			return nil, fmt.Errorf("failed to validate/refresh token: %w", err)
-		}
-		return &fs.ConfigOut{State: ""}, nil
-	case "authorize":
-		appID := opt.AppID
-		if config.Result != "" {
-			appID = config.Result
-			m.Set("app_id", appID)
-		}
-		// Use TokenSource to save token
-		fc := fshttp.NewClient(ctx)
-		ts := &TokenSource{
-			c:    rest.NewClient(fc),
-			ctx:  ctx,
-			name: name,
-			m:    m,
-		}
-		err = ts.Auth(appID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to authenticate: %w", err)
-		}
-		return &fs.ConfigOut{State: ""}, nil
-	}
-	return nil, fmt.Errorf("unknown config state %q", config.State)
-}
-
-// parseSignCheckRange parses and validates an inclusive secondary authentication range.
 func parseSignCheckRange(signCheck string, size int64) (start, end int64, err error) {
 	parts := strings.Split(signCheck, "-")
 	if len(parts) != 2 {
@@ -1089,6 +942,11 @@ func parseSignCheckRange(signCheck string, size int64) (start, end int64, err er
 }
 
 func (f *Fs) newOSSBucket(ctx context.Context, token api.UploadTokenData, bucketName string) (*oss.Bucket, error) {
+	if f.opt.UserAgent != "" {
+		var config *fs.ConfigInfo
+		ctx, config = fs.AddConfig(ctx)
+		config.UserAgent = f.opt.UserAgent
+	}
 	ossClient, err := oss.New(token.Endpoint, token.AccessKeyID, token.AccessKeySecret,
 		oss.SecurityToken(token.SecurityToken), oss.HTTPClient(fshttp.NewClient(ctx)))
 	if err != nil {
@@ -1115,7 +973,10 @@ func shouldRetryOSS(ctx context.Context, err error) (bool, error) {
 
 func isOSSAuthError(err error) bool {
 	var serviceErr oss.ServiceError
-	return errors.As(err, &serviceErr) && serviceErr.StatusCode == http.StatusForbidden
+	if !errors.As(err, &serviceErr) || serviceErr.StatusCode != http.StatusForbidden {
+		return false
+	}
+	return strings.Contains(serviceErr.Code, "InvalidAccessKeyId") || strings.Contains(serviceErr.Code, "SecurityToken") || strings.Contains(serviceErr.Code, "AccessDenied")
 }
 
 func parseUploadResult(body []byte, wantSize int64, wantSHA1 string) (*api.UploadResult, error) {
@@ -1144,7 +1005,7 @@ func parseUploadResult(body []byte, wantSize int64, wantSHA1 string) (*api.Uploa
 }
 
 func (f *Fs) refreshOSSBucket(ctx context.Context, bucketName string) (*oss.Bucket, error) {
-	token, err := f.getValidUploadToken(ctx)
+	token, err := f.validUploadToken(ctx, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1208,34 +1069,6 @@ func retryReadSeeker(ctx context.Context, in io.Reader, size int64) (io.ReadSeek
 	return copyReaderToTempFile(ctx, in, size)
 }
 
-// ossSHA1Context encodes a block-aligned SHA1 prefix for independent OSS parts.
-func ossSHA1Context(h encoding.BinaryMarshaler) (string, error) {
-	state, err := h.MarshalBinary()
-	if err != nil {
-		return "", err
-	}
-	if len(state) != 96 || string(state[:4]) != "sha\x01" {
-		return "", errors.New("invalid SHA1 state encoding")
-	}
-	length := binary.BigEndian.Uint64(state[88:])
-	if length%sha1.BlockSize != 0 {
-		return "", errors.New("OSS SHA1 context requires a block-aligned prefix")
-	}
-	bits := length * 8
-	fields := map[string]string{
-		"hash_type": "sha1", "Nl": strconv.FormatUint(uint64(uint32(bits)), 10),
-		"Nh": strconv.FormatUint(bits>>32, 10), "data": "", "num": "0",
-	}
-	for i := range 5 {
-		fields["h"+strconv.Itoa(i)] = strconv.FormatUint(uint64(binary.BigEndian.Uint32(state[4+i*4:])), 10)
-	}
-	body, err := json.Marshal(fields)
-	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(body), nil
-}
-
 func stageUploadPart(ctx context.Context, in io.Reader, size int64) (io.ReadSeeker, int64, func(), error) {
 	if ra, ok := in.(io.ReaderAt); ok {
 		if rs, ok := in.(io.ReadSeeker); ok && isActuallySeekable(rs) {
@@ -1257,7 +1090,7 @@ func stageUploadPart(ctx context.Context, in io.Reader, size int64) (io.ReadSeek
 		buffer = rw
 		cleanup = func() { _ = rw.Close() }
 	} else {
-		file, err := os.CreateTemp("", "rclone-open115-part-*")
+		file, err := os.CreateTemp("", "rclone-115netdisk-part-*")
 		if err != nil {
 			return nil, 0, func() {}, fmt.Errorf("failed to create multipart temporary file: %w", err)
 		}
@@ -1486,7 +1319,7 @@ func isActuallySeekable(rs io.ReadSeeker) bool {
 // copyReaderToTempFile copies an upload stream to a temporary file and returns it as an io.ReadSeeker.
 func copyReaderToTempFile(ctx context.Context, in io.Reader, size int64) (rs io.ReadSeeker, cleanup func(), err error) {
 	// Create temporary file
-	tempFile, err := os.CreateTemp("", "rclone-open115-upload-*")
+	tempFile, err := os.CreateTemp("", "rclone-115netdisk-upload-*")
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("failed to create temporary file: %w", err)
 	}
@@ -1704,7 +1537,7 @@ func (f *Fs) initializeUpload(ctx context.Context, remote, directoryID string, s
 		FileName: encodedFileName,
 		FileSize: size,
 		Target:   "U_1_" + directoryID, // Format: U_1_dirID
-		FileID:   fileSHA1,
+		FileID:   strings.ToUpper(fileSHA1),
 	}
 
 	// Execute upload initialization request
@@ -1714,7 +1547,7 @@ func (f *Fs) initializeUpload(ctx context.Context, remote, directoryID string, s
 	}
 
 	initData := initResp.Data
-	if initData.Status == 6 || initData.Status == 7 || initData.Status == 8 {
+	if initData.Status == 7 {
 		// Parse authentication range
 		start, end, err := parseSignCheckRange(initData.SignCheck, size)
 		if err != nil {
@@ -1876,16 +1709,11 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 
 	// Check if fast upload succeeded
 	if initData.Status == 2 {
-		fs.Debugf(f, "Fast upload successful for %s, file ID: %s", remote, initData.FileID)
-		// Create and return new object
-		return f.newObjectWithInfo(ctx, remote, &api.FileInfo{
-			FID:  initData.FileID,
-			FN:   path.Base(remote),
-			PC:   initData.PickCode,
-			FS:   json.Number(fmt.Sprintf("%d", size)),
-			UPT:  time.Now().Unix(),
-			SHA1: prepared.sha1Hash,
-		})
+		info, err := f.confirmUploaded(ctx, directoryID, f.opt.Enc.FromStandardName(path.Base(remote)), size, prepared.sha1Hash, initData.PickCode)
+		if err != nil {
+			return nil, err
+		}
+		return f.newObjectWithInfo(ctx, remote, info)
 	}
 
 	// Get upload token for OSS
@@ -1913,242 +1741,14 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote
 		return nil, fmt.Errorf("failed to upload file to OSS: %w", err)
 	}
 
-	// Create and return new object
-	return f.newObjectWithInfo(ctx, remote, &api.FileInfo{
-		FID:  result.FileID,
-		FN:   path.Base(remote),
-		PC:   result.PickCode,
-		FS:   json.Number(fmt.Sprintf("%d", size)),
-		UPT:  time.Now().Unix(),
-		SHA1: prepared.sha1Hash,
-	})
-}
-
-func resetAPIResponse(response any) {
-	if responseWithState, ok := response.(interface{ GetResponse() *api.Response }); ok {
-		*responseWithState.GetResponse() = api.Response{}
-	}
-}
-
-func (f *Fs) callAPI(ctx context.Context, opts rest.Opts, response any, apiResp *api.Response) error {
-	return f.pacer.Call(func() (bool, error) {
-		callOpts := opts
-		resetAPIResponse(response)
-		httpResp, err := f.client.CallJSON(ctx, &callOpts, nil, response)
-		return shouldRetry(ctx, httpResp, apiResp, err)
-	})
-}
-
-func (f *Fs) callAPIWithForm(ctx context.Context, opts rest.Opts, form url.Values, response any, apiResp *api.Response) error {
-	encoded := form.Encode()
-	opts.ContentType = "application/x-www-form-urlencoded"
-	return f.pacer.Call(func() (bool, error) {
-		callOpts := opts
-		callOpts.Body = strings.NewReader(encoded)
-		resetAPIResponse(response)
-		httpResp, err := f.client.CallJSON(ctx, &callOpts, nil, response)
-		return shouldRetry(ctx, httpResp, apiResp, err)
-	})
-}
-
-func shouldRetry(ctx context.Context, res *http.Response, resp *api.Response, err error) (bool, error) {
-	if fserrors.ContextError(ctx, &err) {
-		return false, err
-	}
-
-	if resp != nil && !resp.Success() {
-		err = &apiError{response: *resp}
-		if resp.Code == open115InternalErrorCode || resp.Code == open115OperationPendingCode {
-			return true, err
-		}
-		if resp.Code == open115AccessLimitCode {
-			return false, fserrors.NoRetryError(err)
-		}
-		return false, fserrors.NoRetryError(err)
-	}
-
-	retry := false
-	if res != nil {
-		switch res.StatusCode {
-		case http.StatusTooManyRequests, http.StatusServiceUnavailable:
-			if retryAfterValue := res.Header.Get("Retry-After"); retryAfterValue != "" {
-				retryAfter, parseErr := strconv.Atoi(retryAfterValue)
-				if parseErr != nil {
-					fs.Debugf(nil, "Failed to parse Retry-After: %q: %v", retryAfterValue, parseErr)
-				} else {
-					retry = true
-					err = pacer.RetryAfterError(err, time.Second*time.Duration(retryAfter))
-				}
-			}
-		}
-	}
-
-	return retry || fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(res, retryHTTPStatusCodes), err
-}
-
-type apiError struct {
-	response api.Response
-}
-
-func (e *apiError) Error() string {
-	return "API error: " + e.response.ErrorDetails()
-}
-
-// download starts a download from a generated URL and returns the response body reader.
-func (f *Fs) download(ctx context.Context, urlFn func(context.Context) (string, error), size int64, options ...fs.OpenOption) (io.ReadCloser, error) {
-	opts := rest.Opts{
-		Method: "GET",
-	}
-	opts.Options = options
-	var resp *http.Response
-	var downloadURL string
-	err := f.pacer.Call(func() (bool, error) {
-		var err error
-		if downloadURL == "" {
-			downloadURL, err = urlFn(ctx)
-			if err != nil {
-				return false, err
-			}
-			opts.RootURL = downloadURL
-		}
-		resp, err = f.client.Call(ctx, &opts)
-		retry, err := shouldRetry(ctx, resp, nil, err)
-		if retry || fserrors.ContextError(ctx, &err) {
-			if resp != nil && resp.Body != nil {
-				_ = resp.Body.Close()
-			}
-			return retry, err
-		}
-		if resp != nil && resp.StatusCode == http.StatusForbidden {
-			if resp.Body != nil {
-				_ = resp.Body.Close()
-			}
-			downloadURL = ""
-			return true, err
-		}
-		return false, err
-	})
+	info, err := f.confirmUploaded(ctx, directoryID, f.opt.Enc.FromStandardName(path.Base(remote)), size, prepared.sha1Hash, result.PickCode)
 	if err != nil {
 		return nil, err
 	}
-	if resp == nil || resp.Body == nil {
-		return nil, errors.New("download failed: empty response")
+	if info.FID != result.FileID || (result.CID != "" && result.CID != directoryID) {
+		return nil, errors.New("upload callback has a different committed object identity or parent")
 	}
-	if err := rest.CheckContentRange(resp, options, size); err != nil {
-		_ = resp.Body.Close()
-		return nil, err
-	}
-	return resp.Body, nil
-}
-
-// createFolder creates a new folder.
-func (f *Fs) createFolder(ctx context.Context, pid string, fileName string) (*api.FolderCreateResponse, error) {
-	// Encode the file name for the API
-	encodedFileName := f.opt.Enc.FromStandardName(fileName)
-	values := url.Values{}
-	values.Set("pid", pid)
-	values.Set("file_name", encodedFileName)
-	opts := rest.Opts{
-		Method:  "POST",
-		RootURL: baseAPI,
-		Path:    "/open/folder/add",
-	}
-	var resp api.FolderCreateResponse
-	err := f.callAPIWithForm(ctx, opts, values, &resp, &resp.Response)
-	if err != nil {
-		return nil, err
-	}
-	return &resp, nil
-}
-
-// getFileList gets the list of files and folders.
-func (f *Fs) getFileList(ctx context.Context, parentID string, pageSize, offset int64) (*api.FileListResponse, error) {
-
-	// Build query parameters
-	params := url.Values{}
-	params.Set("cid", parentID)
-	params.Set("limit", fmt.Sprintf("%d", pageSize))
-	params.Set("offset", fmt.Sprintf("%d", offset))
-	params.Set("cur", "1")
-	params.Set("stdir", "1")
-	params.Set("show_dir", "1")
-	opts := rest.Opts{
-		Method:     "GET",
-		RootURL:    baseAPI,
-		Path:       "/open/ufile/files",
-		Parameters: params,
-	}
-	var resp api.FileListResponse
-	err := f.callAPI(ctx, opts, &resp, &resp.Response)
-	if err != nil {
-		return nil, err
-	}
-	return &resp, nil
-}
-
-// getFileDownloadURL gets the download URL for a file.
-func (f *Fs) getFileDownloadURL(ctx context.Context, pickCode string) (*api.FileDownloadResponse, error) {
-	formData := url.Values{}
-	formData.Set("pick_code", pickCode)
-	opts := rest.Opts{
-		Method:  "POST",
-		RootURL: baseAPI,
-		Path:    "/open/ufile/downurl",
-	}
-
-	var resp api.FileDownloadResponse
-	err := f.callAPIWithForm(ctx, opts, formData, &resp, &resp.Response)
-	if err != nil {
-		return nil, err
-	}
-
-	return &resp, nil
-}
-
-// deleteFiles deletes files or folders.
-func (f *Fs) deleteFiles(ctx context.Context, fileIDs []string, parentID string) (*api.FileOperationResponse, error) {
-	formData := url.Values{}
-	formData.Set("file_ids", strings.Join(fileIDs, ","))
-	if parentID != "" {
-		formData.Set("parent_id", parentID)
-	}
-
-	opts := rest.Opts{
-		Method:  "POST",
-		RootURL: baseAPI,
-		Path:    "/open/ufile/delete",
-	}
-
-	var resp api.FileOperationResponse
-	err := f.callAPIWithForm(ctx, opts, formData, &resp, &resp.Response)
-	if err != nil {
-		return nil, err
-	}
-
-	return &resp, nil
-}
-
-// updateFile updates file information (rename or star).
-func (f *Fs) updateFile(ctx context.Context, fileID string, options map[string]string) (*api.FileUpdateResponse, error) {
-	formData := url.Values{}
-	formData.Set("file_id", fileID)
-	for key, value := range options {
-		formData.Set(key, value)
-	}
-
-	opts := rest.Opts{
-		Method:  "POST",
-		RootURL: baseAPI,
-		Path:    "/open/ufile/update",
-	}
-
-	var resp api.FileUpdateResponse
-	err := f.callAPIWithForm(ctx, opts, formData, &resp, &resp.Response)
-	if err != nil {
-		return nil, err
-	}
-
-	return &resp, nil
+	return f.newObjectWithInfo(ctx, remote, info)
 }
 
 func (f *Fs) renameFile(ctx context.Context, fileID, leaf string) error {
@@ -2201,23 +1801,17 @@ func (f *Fs) parkDestination(ctx context.Context, previous fs.Object, directoryI
 	return "", errDestinationHasDuplicates
 }
 
-func (f *Fs) hasOtherLeaf(ctx context.Context, directoryID, leaf, excludedID string) (bool, error) {
-	var offset int64
-	for {
-		resp, err := f.getFileList(ctx, directoryID, defaultListPageSize, offset)
-		if err != nil {
-			return false, err
-		}
-		for _, item := range resp.Data {
-			if item.FID != excludedID && f.opt.Enc.ToStandardName(item.FN) == leaf {
-				return true, nil
-			}
-		}
-		if len(resp.Data) < defaultListPageSize {
-			return false, nil
-		}
-		offset += defaultListPageSize
+func (f *Fs) hasOtherLeaf(ctx context.Context, cid, leaf, excludedID string) (bool, error) {
+	entries, err := f.listAll(ctx, cid)
+	if err != nil {
+		return false, err
 	}
+	for _, item := range entries {
+		if item.FID != excludedID && f.opt.Enc.ToStandardName(item.FN) == leaf {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // performMoveFiles moves files with enhanced logic for different scenarios.
@@ -2299,131 +1893,18 @@ func (f *Fs) performMoveDirs(ctx context.Context, srcDirID, dstDirID, srcLeaf, d
 }
 
 // moveFiles moves files.
-func (f *Fs) moveFiles(ctx context.Context, fileIDs []string, toCID string) (*api.FileOperationResponse, error) {
-	formData := url.Values{}
-	formData.Set("file_ids", strings.Join(fileIDs, ","))
-	formData.Set("to_cid", toCID)
-
-	opts := rest.Opts{
-		Method:  "POST",
-		RootURL: baseAPI,
-		Path:    "/open/ufile/move",
-	}
-
-	var resp api.FileOperationResponse
-	err := f.callAPIWithForm(ctx, opts, formData, &resp, &resp.Response)
+func (f *Fs) moveFiles(ctx context.Context, ids []string, cid string) (*api.FileOperationResponse, error) {
+	form, err := indexedIDs(ids)
 	if err != nil {
 		return nil, err
 	}
-	return &resp, nil
+	form.Set("pid", cid)
+	var response api.FileOperationResponse
+	err = f.callAPIWithForm(ctx, rest.Opts{Method: "POST", RootURL: baseAPI, Path: "/files/move"}, form, &response, &response.Response)
+	return &response, err
 }
 
 // getUploadToken gets the upload token
-func (f *Fs) getUploadToken(ctx context.Context) (*api.UploadTokenResponse, error) {
-	opts := rest.Opts{
-		Method:  "GET",
-		RootURL: baseAPI,
-		Path:    "/open/upload/get_token",
-	}
-
-	var resp api.UploadTokenResponse
-	err := f.callAPI(ctx, opts, &resp, &resp.Response)
-	if err != nil {
-		return nil, err
-	}
-
-	return &resp, nil
-}
-
-var errUploadTokenExpired = errors.New("OSS upload token is expired")
-
-func validateUploadToken(token *api.UploadTokenData, now time.Time) error {
-	if token.Endpoint == "" || token.AccessKeyID == "" || token.AccessKeySecret == "" || token.SecurityToken == "" {
-		return errors.New("upload token response is incomplete")
-	}
-	expires, err := time.Parse(time.RFC3339Nano, token.Expiration)
-	if err != nil {
-		return fmt.Errorf("invalid upload token expiration %q: %w", token.Expiration, err)
-	}
-	if !expires.After(now.Add(tokenExpiryGrace)) {
-		return errUploadTokenExpired
-	}
-	return nil
-}
-
-func (f *Fs) getValidUploadToken(ctx context.Context) (*api.UploadTokenData, error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		resp, err := f.getUploadToken(ctx)
-		if err != nil {
-			return nil, err
-		}
-		err = validateUploadToken(&resp.Data, time.Now())
-		if err == nil {
-			return &resp.Data, nil
-		}
-		if !errors.Is(err, errUploadTokenExpired) {
-			return nil, err
-		}
-	}
-	return nil, errUploadTokenExpired
-}
-
-// initUpload initializes file upload
-func (f *Fs) initUpload(ctx context.Context, req *api.InitUploadRequest) (*api.InitUploadResponse, error) {
-	// Build form data
-	formData := url.Values{}
-	formData.Set("file_name", req.FileName)
-	formData.Set("file_size", fmt.Sprintf("%d", req.FileSize))
-	formData.Set("target", req.Target)
-	formData.Set("fileid", req.FileID)
-
-	if req.PreID != "" {
-		formData.Set("preid", req.PreID)
-	}
-	if req.PickCode != "" {
-		formData.Set("pick_code", req.PickCode)
-	}
-	if req.TopUpload != 0 {
-		formData.Set("topupload", fmt.Sprintf("%d", req.TopUpload))
-	}
-	if req.SignKey != "" {
-		formData.Set("sign_key", req.SignKey)
-	}
-	if req.SignVal != "" {
-		formData.Set("sign_val", req.SignVal)
-	}
-
-	opts := rest.Opts{
-		Method:  "POST",
-		RootURL: baseAPI,
-		Path:    "/open/upload/init",
-	}
-
-	var resp api.InitUploadResponse
-	err := f.callAPIWithForm(ctx, opts, formData, &resp, &resp.Response)
-	if err != nil {
-		return nil, err
-	}
-
-	return &resp, nil
-}
-
-// getUserInfo gets the user information including space usage and VIP status.
-func (f *Fs) getUserInfo(ctx context.Context) (*api.UserInfoResponse, error) {
-	opts := rest.Opts{
-		Method:  "GET",
-		RootURL: baseAPI,
-		Path:    "/open/user/info",
-	}
-
-	var resp api.UserInfoResponse
-	err := f.callAPI(ctx, opts, &resp, &resp.Response)
-	if err != nil {
-		return nil, err
-	}
-	return &resp, nil
-}
-
 // copyWithTempDir copies through an empty directory so the new object ID is unambiguous.
 func (f *Fs) copyWithTempDir(ctx context.Context, srcDirID, dstDirID, dstLeaf string, fileIDs []string) (*api.FileInfo, error) {
 	// Generate a unique temporary directory name and create it
@@ -2438,7 +1919,7 @@ func (f *Fs) copyWithTempDir(ctx context.Context, srcDirID, dstDirID, dstLeaf st
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		if cleanupErr := f.cleanupTempDir(cleanupCtx, tempDirID); cleanupErr != nil {
+		if cleanupErr := f.cleanupTempDir(cleanupCtx, tempDirID, srcDirID); cleanupErr != nil {
 			fs.Errorf(f, "Failed to cleanup temporary directory %s: %v", tempDirID, cleanupErr)
 		}
 	}()
@@ -2472,51 +1953,30 @@ func (f *Fs) copyWithTempDir(ctx context.Context, srcDirID, dstDirID, dstLeaf st
 }
 
 // cleanupTempDir removes the temporary directory and any remaining files
-func (f *Fs) cleanupTempDir(ctx context.Context, tempDirID string) error {
+func (f *Fs) cleanupTempDir(ctx context.Context, tempDirID, parentID string) error {
 	// Delete the temporary directory (this should also delete any remaining files)
-	_, err := f.deleteFiles(ctx, []string{tempDirID}, "")
+	_, err := f.deleteFiles(ctx, []string{tempDirID}, parentID)
 	return err
 }
 
-// performCopy executes the actual copy operation via API
-func (f *Fs) performCopy(ctx context.Context, pid string, fileIDs []string) error {
-	// Use proper form data encoding
-	values := url.Values{}
-	values.Set("pid", pid)
-	values.Set("file_id", strings.Join(fileIDs, ","))
-	values.Set("no_dupli", "0")
-	opts := rest.Opts{
-		Method:  "POST",
-		RootURL: baseAPI,
-		Path:    "/open/ufile/copy",
-	}
-
-	var resp api.FileOperationResponse
-	err := f.callAPIWithForm(ctx, opts, values, &resp, &resp.Response)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
 // findCopiedFile returns the only file in a fresh temporary directory.
-func (f *Fs) findCopiedFile(ctx context.Context, dstDirID string) (*api.FileInfo, error) {
-	resp, err := f.getFileList(ctx, dstDirID, defaultListPageSize, 0)
+func (f *Fs) findCopiedFile(ctx context.Context, cid string) (*api.FileInfo, error) {
+	entries, err := f.listAll(ctx, cid)
 	if err != nil {
 		return nil, err
 	}
 	var copied *api.FileInfo
-	for i := range resp.Data {
-		if resp.Data[i].FC != fileCategoryFolder {
+	for _, item := range entries {
+		if item.FC != fileCategoryFolder {
 			if copied != nil {
-				return nil, errors.New("temporary copy directory contains multiple files")
+				return nil, errors.New("temporary copy directory has multiple files")
 			}
-			copied = &resp.Data[i]
+			value := item
+			copied = &value
 		}
 	}
 	if copied == nil {
-		return nil, errors.New("copied file not found in temporary directory")
+		return nil, errors.New("copied file not found")
 	}
 	return copied, nil
 }
@@ -2532,6 +1992,368 @@ func (f *Fs) getNormalizedPath(p string) (parent, leaf string) {
 	return
 }
 
+func (f *Fs) getFileList(ctx context.Context, cid string, limit, offset int64) (*api.FileListResponse, error) {
+	query := url.Values{"aid": {"1"}, "cid": {cid}, "limit": {strconv.FormatInt(limit, 10)}, "offset": {strconv.FormatInt(offset, 10)},
+		"cur": {"1"}, "stdir": {"1"}, "show_dir": {"1"}, "format": {"json"}, "o": {"file_name"}, "asc": {"1"}, "fc_mix": {"1"}, "natsort": {"1"}, "custom_order": {"1"}, "record_open_time": {"0"}, "last_utime": {"0"}}
+	var response api.FileListResponse
+	if err := f.callAPI(ctx, rest.Opts{Method: "GET", RootURL: baseAPI, Path: "/files", Parameters: query}, &response, &response.Response); err != nil {
+		return nil, err
+	}
+	if string(response.CID) != cid {
+		return nil, fmt.Errorf("directory response has a different identity: %w", fs.ErrorDirNotFound)
+	}
+	if response.UseCache || !response.CountPresent {
+		return nil, errors.New("directory response is cached or has no count")
+	}
+	if response.Offset != offset {
+		return nil, errors.New("directory pagination moved to a different offset")
+	}
+	return &response, nil
+}
+
+func (f *Fs) listAll(ctx context.Context, cid string) ([]api.FileInfo, error) {
+	var entries []api.FileInfo
+	seen := make(map[string]bool)
+	for page := 0; page < 100000; page++ {
+		response, err := f.getFileList(ctx, cid, defaultListPageSize, int64(len(entries)))
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range response.Data {
+			if seen[item.FID] {
+				return nil, errors.New("directory changed or pagination repeated an object")
+			}
+			seen[item.FID] = true
+			entries = append(entries, item)
+		}
+		if int64(len(entries)) >= response.Count {
+			return entries, nil
+		}
+		if len(response.Data) == 0 {
+			return nil, errors.New("directory pagination ended before the reported count")
+		}
+	}
+	return nil, errors.New("directory pagination exceeds its bound")
+}
+
+func (f *Fs) createFolder(ctx context.Context, pid, name string) (*api.FolderCreateResponse, error) {
+	var response api.FolderCreateResponse
+	err := f.callAPIWithForm(ctx, rest.Opts{Method: "POST", RootURL: baseAPI, Path: "/files/add"}, url.Values{"pid": {pid}, "cname": {f.opt.Enc.FromStandardName(name)}}, &response, &response.Response)
+	if err != nil {
+		return nil, err
+	}
+	if response.Data == nil || response.Data.FileID == "" {
+		return nil, errors.New("directory creation did not return an identity")
+	}
+	entries, err := f.listAll(ctx, pid)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range entries {
+		if item.FID == response.Data.FileID.String() && item.FC == fileCategoryFolder {
+			if f.opt.Enc.ToStandardName(item.FN) != name {
+				return nil, errors.New("server changed the requested directory name")
+			}
+			return &response, nil
+		}
+	}
+	return nil, errors.New("created directory is not visible in its parent")
+}
+
+func indexedIDs(ids []string) (url.Values, error) {
+	if len(ids) == 0 {
+		return nil, errors.New("empty file selection")
+	}
+	form := url.Values{}
+	for i, id := range ids {
+		if id == "" {
+			return nil, errors.New("empty file identity")
+		}
+		form.Set(fmt.Sprintf("fid[%d]", i), id)
+	}
+	return form, nil
+}
+
+func (f *Fs) deleteFiles(ctx context.Context, ids []string, pid string) (*api.FileOperationResponse, error) {
+	form, err := indexedIDs(ids)
+	if err != nil {
+		return nil, err
+	}
+	if pid == "" {
+		return nil, errors.New("deletion requires the known parent directory")
+	}
+	form.Set("pid", pid)
+	form.Set("ignore_warn", "0")
+	var response api.FileOperationResponse
+	for attempt := 0; attempt < 4; attempt++ {
+		err = f.callAPIWithForm(ctx, rest.Opts{Method: "POST", RootURL: baseAPI, Path: "/rb/delete"}, form, &response, &response.Response)
+		if err == nil {
+			return &response, nil
+		}
+		var business *apiError
+		if !errors.As(err, &business) || !strings.Contains(business.response.Message, "操作尚未执行完成") {
+			return nil, err
+		}
+		entries, readErr := f.listAll(ctx, pid)
+		if readErr != nil {
+			return nil, errors.Join(err, readErr)
+		}
+		present := make(map[string]bool)
+		for _, entry := range entries {
+			present[entry.FID] = true
+		}
+		remaining := make([]string, 0, len(ids))
+		for _, id := range ids {
+			if present[id] {
+				remaining = append(remaining, id)
+			}
+		}
+		if len(remaining) == 0 {
+			return &response, nil
+		}
+		if attempt == 3 {
+			return nil, err
+		}
+		form, err = indexedIDs(remaining)
+		if err != nil {
+			return nil, err
+		}
+		form.Set("pid", pid)
+		form.Set("ignore_warn", "0")
+		timer := time.NewTimer(time.Duration(attempt+1) * 3 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, err
+}
+
+func (f *Fs) updateFile(ctx context.Context, id string, values map[string]string) (*api.FileUpdateResponse, error) {
+	form := url.Values{"fid": {id}}
+	for key, value := range values {
+		form.Set(key, value)
+	}
+	var response api.FileUpdateResponse
+	err := f.callAPIWithForm(ctx, rest.Opts{Method: "POST", RootURL: baseAPI, Path: "/files/edit"}, form, &response, &response.Response)
+	return &response, err
+}
+
+func (f *Fs) performCopy(ctx context.Context, cid string, ids []string) error {
+	form, err := indexedIDs(ids)
+	if err != nil {
+		return err
+	}
+	form.Set("pid", cid)
+	var response api.FileOperationResponse
+	return f.callAPIWithForm(ctx, rest.Opts{Method: "POST", RootURL: baseAPI, Path: "/files/copy"}, form, &response, &response.Response)
+}
+
+func (f *Fs) getUserInfo(ctx context.Context) (*api.UserInfoResponse, error) {
+	var response api.UserInfoResponse
+	err := f.callAPI(ctx, rest.Opts{Method: "GET", RootURL: baseAPI, Path: "/files/index_info"}, &response, &response.Response)
+	return &response, err
+}
+
+func (f *Fs) initUpload(ctx context.Context, request *api.InitUploadRequest) (*api.InitUploadResponse, error) {
+	key, err := f.client.uploadKey(ctx)
+	if err != nil {
+		return nil, err
+	}
+	codec, err := newECContext()
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	fileID := strings.ToUpper(request.FileID)
+	form := f.uploadForm(request, key, now)
+	body, err := codec.encrypt([]byte(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	encoded, _, err := f.client.raw(ctx, &rest.Opts{Method: "POST", RootURL: uploadAPI, Path: "/4.0/initupload.php", Parameters: url.Values{"k_ec": {codec.queryToken(uint32(f.client.userID), now)}}, ContentType: "application/x-www-form-urlencoded", Body: bytes.NewReader(body)})
+	if err != nil {
+		return nil, err
+	}
+	decoded, err := codec.decode(encoded)
+	if err != nil {
+		return nil, err
+	}
+	var data api.InitUploadData
+	if err = json.Unmarshal(decoded, &data); err != nil {
+		return nil, err
+	}
+	if data.Status != 1 && data.Status != 2 && data.Status != 7 {
+		return nil, fmt.Errorf("upload initialization failed (%d/%d): %s", data.Status, data.StatusCode, data.StatusMessage)
+	}
+	if data.Status == 2 {
+		cid := strings.TrimPrefix(request.Target, "U_1_")
+		info, err := f.confirmUploaded(ctx, cid, request.FileName, request.FileSize, fileID, data.PickCode)
+		if err != nil {
+			return nil, err
+		}
+		data.FileID = info.FID
+	}
+	return &api.InitUploadResponse{Data: data}, nil
+}
+
+func (f *Fs) confirmUploaded(ctx context.Context, cid, name string, size int64, sha1, pickcode string) (*api.FileInfo, error) {
+	if pickcode == "" {
+		return nil, errors.New("upload result has no pickcode")
+	}
+	for attempt := 0; attempt < 6; attempt++ {
+		entries, err := f.listAll(ctx, cid)
+		if err != nil {
+			return nil, err
+		}
+		var found *api.FileInfo
+		for _, item := range entries {
+			if item.PC != pickcode || item.FC == fileCategoryFolder {
+				continue
+			}
+			actualSize, err := item.FS.Int64()
+			if err != nil {
+				return nil, err
+			}
+			if item.FN != name || actualSize != size || !strings.EqualFold(item.SHA1, sha1) {
+				return nil, errors.New("committed upload differs from its name, size or SHA1 contract")
+			}
+			if found != nil {
+				return nil, errors.New("upload pickcode has multiple cloud objects")
+			}
+			value := item
+			found = &value
+		}
+		if found != nil {
+			return found, nil
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, errors.New("upload not visible in its target directory")
+}
+
+type downloadInfo struct {
+	URL     string
+	Cookies map[string]string
+}
+
+func (f *Fs) downloadAddress(ctx context.Context, id, pickcode string) (*downloadInfo, error) {
+	seed := make([]byte, 16)
+	if _, err := rand.Read(seed); err != nil {
+		return nil, err
+	}
+	plaintext, err := json.Marshal(map[string]string{"pickcode": pickcode})
+	if err != nil {
+		return nil, err
+	}
+	data, err := m115Encode(plaintext, seed)
+	if err != nil {
+		return nil, err
+	}
+	body, response, err := f.client.raw(ctx, &rest.Opts{Method: "POST", RootURL: baseAPI, Path: "/files/download", ContentType: "application/x-www-form-urlencoded; charset=utf-8", Body: strings.NewReader(url.Values{"data": {data}}.Encode())})
+	if err != nil {
+		return nil, err
+	}
+	var state api.Response
+	if err = json.Unmarshal(body, &state); err != nil {
+		return nil, err
+	}
+	if !state.Success() {
+		return nil, &apiError{response: state}
+	}
+	var envelope struct {
+		Data string `json:"data"`
+	}
+	if err = json.Unmarshal(body, &envelope); err != nil {
+		return nil, err
+	}
+	decoded, err := m115Decode(envelope.Data, seed)
+	if err != nil {
+		return nil, err
+	}
+	if err = json.Unmarshal(decoded, &state); err != nil {
+		return nil, err
+	}
+	if !state.Success() {
+		return nil, &apiError{response: state}
+	}
+	var link struct {
+		URL      string     `json:"file_url"`
+		ID       api.String `json:"file_id"`
+		PickCode string     `json:"pickcode"`
+	}
+	if err = json.Unmarshal(decoded, &link); err != nil {
+		return nil, err
+	}
+	parsed, err := url.Parse(link.URL)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+		return nil, errors.New("download response has no valid URL")
+	}
+	if string(link.ID) != id || link.PickCode != pickcode {
+		return nil, errors.New("download response has a different file identity")
+	}
+	cookies := make(map[string]string)
+	for _, cookie := range response.Cookies() {
+		cookies[cookie.Name] = cookie.Value
+	}
+	return &downloadInfo{URL: link.URL, Cookies: cookies}, nil
+}
+
+func (f *Fs) download(ctx context.Context, id, pickcode string, size int64, options ...fs.OpenOption) (io.ReadCloser, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		info, err := f.downloadAddress(ctx, id, pickcode)
+		if err != nil {
+			return nil, err
+		}
+		headers := map[string]string{"User-Agent": f.client.userAgent, "Cookie": cookieHeader(f.client.cookies, info.Cookies)}
+		redirect := func(request *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("download redirect limit reached")
+			}
+			if request.URL.Scheme != "https" {
+				return errors.New("download redirect requires HTTPS")
+			}
+			host := request.URL.Hostname()
+			if request.Response != nil {
+				for _, cookie := range request.Response.Cookies() {
+					info.Cookies[cookie.Name] = cookie.Value
+				}
+				headers["Cookie"] = cookieHeader(f.client.cookies, info.Cookies)
+			}
+			if host != "115.com" && !strings.HasSuffix(host, ".115.com") {
+				request.Header.Del("Cookie")
+			} else {
+				request.Header.Set("Cookie", headers["Cookie"])
+			}
+			request.Header.Set("User-Agent", f.client.userAgent)
+			if request.Header.Get("Range") == "" && len(via) > 0 {
+				request.Header.Set("Range", via[0].Header.Get("Range"))
+			}
+			return nil
+		}
+		response, err := f.client.content.Call(ctx, &rest.Opts{Method: "GET", RootURL: info.URL, ExtraHeaders: headers, Options: options, CheckRedirect: redirect})
+		if err != nil {
+			if response != nil && response.StatusCode == 403 && attempt < 2 {
+				continue
+			}
+			return nil, err
+		}
+		if err = rest.CheckContentRange(response, options, size); err != nil {
+			return nil, errors.Join(err, response.Body.Close())
+		}
+		return response.Body, nil
+	}
+	return nil, errors.New("download address recovery exhausted")
+}
+
 // Interfaces implementation check
 var (
 	_ fs.Fs              = (*Fs)(nil)
@@ -2545,3 +2367,17 @@ var (
 	_ fs.Object          = (*Object)(nil)
 	_ dircache.DirCacher = (*Fs)(nil)
 )
+
+func (f *Fs) uploadForm(request *api.InitUploadRequest, key string, now time.Time) url.Values {
+	fileID := strings.ToUpper(request.FileID)
+	form := url.Values{"userid": {strconv.FormatInt(f.client.userID, 10)}, "appid": {"100"}, "appversion": {f.client.version},
+		"filename": {request.FileName}, "filesize": {strconv.FormatInt(request.FileSize, 10)}, "fileid": {fileID}, "quickid": {""}, "pickcode": {""},
+		"target": {request.Target}, "sig": {uploadSignature(f.client.userID, fileID, request.Target, key)},
+		"token": {uploadToken(f.client.userID, now.Unix(), request.FileSize, fileID, request.SignKey+request.SignVal, f.client.version)},
+		"t":     {strconv.FormatInt(now.Unix(), 10)}, "isp": {"0"}, "topupload": {"0"}, "json": {"json"}}
+	if request.SignKey != "" {
+		form.Set("sign_key", request.SignKey)
+		form.Set("sign_val", request.SignVal)
+	}
+	return form
+}
